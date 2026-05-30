@@ -1745,10 +1745,38 @@ class SlaveRuntime:
     async def _find_duplicate(
         self,
         normalized_text: str | None,
+        media_unique_id: str | None,
         original_chat_id: int,
         message_id: int,
     ) -> dict[str, int] | None:
-        if not self._duplicate_detection_enabled() or not normalized_text:
+        if not self._duplicate_detection_enabled():
+            return None
+        if media_unique_id:
+            row = await self.pool.fetchrow(
+                """
+                SELECT original_chat_id, id
+                FROM incoming_messages
+                WHERE bot_id = $1
+                    AND media_unique_id = $2
+                    AND created_at >= NOW() - ($3::int * interval '1 day')
+                    AND NOT (original_chat_id = $4 AND id = $5)
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                self.bot_id,
+                media_unique_id,
+                self._duplicate_detection_days(),
+                original_chat_id,
+                message_id,
+            )
+            if row:
+                return {
+                    "original_chat_id": int(row["original_chat_id"]),
+                    "id": int(row["id"]),
+                    "score": DUPLICATE_EXACT_SCORE,
+                }
+
+        if not normalized_text:
             return None
         if len(normalized_text) < DUPLICATE_MIN_CHARS:
             return None
@@ -1851,7 +1879,8 @@ class SlaveRuntime:
 
         raw_message = _message_dump(message)
         normalized_text = _normalize_submission_text(message)
-        duplicate = await self._find_duplicate(normalized_text, message.chat.id, message.message_id)
+        media_unique_id = _media_unique_id(message)
+        duplicate = await self._find_duplicate(normalized_text, media_unique_id, message.chat.id, message.message_id)
         ai_enabled = self._ai_enabled()
         ai_provider = self._ai_provider() if ai_enabled else None
         ai_model = self._ai_model(ai_provider) if ai_provider else None
@@ -1860,10 +1889,10 @@ class SlaveRuntime:
             """
             INSERT INTO incoming_messages (
                 id, original_chat_id, owner_id, bot_id, message, ai_provider, ai_model, ai_analysis,
-                ai_recommendation, ai_publish_score, ai_auto_approved, normalized_text,
+                ai_recommendation, ai_publish_score, ai_auto_approved, normalized_text, media_unique_id,
                 duplicate_of_original_chat_id, duplicate_of_message_id, duplicate_score
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, $11, $12, $13, $14)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, $11, $12, $13, $14, $15)
             ON CONFLICT (bot_id, original_chat_id, id) DO UPDATE SET
                 message = EXCLUDED.message,
                 ai_provider = EXCLUDED.ai_provider,
@@ -1872,6 +1901,7 @@ class SlaveRuntime:
                 ai_recommendation = EXCLUDED.ai_recommendation,
                 ai_publish_score = EXCLUDED.ai_publish_score,
                 normalized_text = EXCLUDED.normalized_text,
+                media_unique_id = EXCLUDED.media_unique_id,
                 duplicate_of_original_chat_id = EXCLUDED.duplicate_of_original_chat_id,
                 duplicate_of_message_id = EXCLUDED.duplicate_of_message_id,
                 duplicate_score = EXCLUDED.duplicate_score,
@@ -1894,6 +1924,7 @@ class SlaveRuntime:
             None,
             None,
             normalized_text,
+            media_unique_id,
             duplicate["original_chat_id"] if duplicate else None,
             duplicate["id"] if duplicate else None,
             duplicate["score"] if duplicate else None,
@@ -3045,6 +3076,20 @@ def _normalize_submission_text(message: Message) -> str | None:
     text = message.text or message.caption or ""
     normalized = _normalize_text(text)
     return normalized or None
+
+
+def _media_unique_id(message: Message) -> str | None:
+    if message.photo:
+        return message.photo[-1].file_unique_id
+    media = (
+        message.video
+        or message.animation
+        or message.document
+        or message.audio
+        or message.voice
+        or message.sticker
+    )
+    return getattr(media, "file_unique_id", None) if media else None
 
 
 def _normalize_text(value: str) -> str:

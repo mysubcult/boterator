@@ -181,7 +181,7 @@ When a moderator clicks reject, the bot asks for a reason and sends that reason 
 
 ## Duplicate Detection
 
-Text and caption duplicates are detected locally from normalized recent submissions for the same registered bot. This uses PostgreSQL data only and does not spend AI tokens.
+Text and caption duplicates are detected locally from normalized recent submissions for the same registered bot. Exact media duplicates for photos, videos, GIFs, documents, audio, voice messages, and stickers are detected by Telegram `file_unique_id`. This uses PostgreSQL data only and does not spend AI tokens.
 
 When a possible duplicate is found, the moderation card shows a warning with the similarity score and previous message key. The bot does not auto-reject duplicates; moderators decide.
 
