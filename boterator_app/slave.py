@@ -1806,7 +1806,7 @@ class SlaveRuntime:
                     original_chat_id,
                     message_id,
                 )
-                await self._notify_author(original_chat_id, message_id, self._t("author_rejected"))
+                await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
                 await callback.answer(self._t("vote_counted_rejected"))
             else:
                 await callback.answer(self._t("vote_counted"))
@@ -1833,7 +1833,7 @@ class SlaveRuntime:
             original_chat_id,
             message_id,
         )
-        await self._notify_author(original_chat_id, message_id, self._t("author_rejected"))
+        await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
         await self._refresh_moderation_status(original_chat_id, message_id, True)
         await callback.answer(self._t("message_rejected"))
 
@@ -2172,7 +2172,7 @@ class SlaveRuntime:
             await self._notify_author(row["original_chat_id"], row["id"], self._t("author_approved"))
             await self._refresh_moderation_status(row["original_chat_id"], row["id"], True)
         for row in expired:
-            await self._notify_author(row["original_chat_id"], row["id"], self._t("vote_expired"))
+            await self._notify_rejection_author(row["original_chat_id"], row["id"], "vote_expired")
             await self._refresh_moderation_status(row["original_chat_id"], row["id"], True)
         if auto_approved:
             await self.publish_ready_messages()
@@ -2391,6 +2391,24 @@ class SlaveRuntime:
             await self.bot.send_message(chat_id, text, reply_to_message_id=message_id)
         except TelegramAPIError:
             LOGGER.debug("Unable to notify author", exc_info=True)
+
+    async def _notify_rejection_author(self, chat_id: int, message_id: int, base_key: str) -> None:
+        analysis = await self.pool.fetchval(
+            """
+            SELECT ai_analysis
+            FROM incoming_messages
+            WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
+            """,
+            self.bot_id,
+            chat_id,
+            message_id,
+        )
+        analysis = str(analysis or "").strip()
+        if analysis:
+            text = self._t(f"{base_key}_with_ai", analysis=_preview_text(analysis, 1400))
+        else:
+            text = self._t(base_key)
+        await self._notify_author(chat_id, message_id, text)
 
     async def _moderation_action_row(self, original_chat_id: int, message_id: int) -> asyncpg.Record | None:
         return await self.pool.fetchrow(
