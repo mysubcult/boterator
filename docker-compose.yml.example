@@ -1,56 +1,37 @@
-version: '3'
-
 services:
   postgres:
-    image: postgres:9.5
-    volumes:
-      - ./schema.sql:/docker-entrypoint-initdb.d/1-schema.sql
-      - pgdata:/var/lib/postgresql/data
+    image: postgres:16-alpine
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
-      POSTGRES_PASSWORD: boterator
-      POSTGRES_USER: boterator
       POSTGRES_DB: boterator
-  burlesque:
-    image: aviasales/burlesque
-    ports:
-      - '4401:4401'
-  boterator:
-    image: virus/boterator:latest
-    depends_on:
-      - postgres
+      POSTGRES_USER: boterator
+      POSTGRES_PASSWORD: boterator
     volumes:
-      - .:/usr/src/app
-    environment:
-      BURLESQUE: http://burlesque:4401
-      DB: "dbname=boterator user=boterator password=boterator host=postgres port=5432"
-      TG_TOKEN: "<GUESS_ME>"
-    entrypoint:
-      - ./wait-for-postgres.sh
-    command:
-      - postgres
-      - boterator
-      - boterator
-      - python3
-      - boterator_server.py
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U boterator -d boterator"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
 
-  slaveholder:
-    image: virus/boterator:latest
+  app:
+    build: .
+    restart: unless-stopped
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
-      - postgres
-    volumes:
-      - .:/usr/src/app
-    entrypoint:
-      - ./wait-for-postgres.sh
-    command:
-      - postgres
-      - boterator
-      - boterator
-      - python3
-      - slaveholder_server.py
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
     environment:
-      BURLESQUE: http://burlesque:4401
-      DB: "dbname=boterator user=boterator password=boterator host=postgres port=5432"
+      DATABASE_URL: postgresql://boterator:boterator@postgres:5432/boterator
 
 volumes:
   pgdata:
-    external: false
