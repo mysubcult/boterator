@@ -9,13 +9,16 @@ Boterator lets users submit posts to a bot, forwards the original Telegram messa
 - Master bot registers separate moderation bots created via BotFather.
 - User submissions are forwarded to moderators and then forwarded to the channel, preserving the original sender header when Telegram allows it.
 - Inline moderator voting with configurable vote count, timeout, publish delay, and content types.
-- Moderator buttons to contact the author through the bot or ban the author from future submissions.
+- Moderator buttons to reject with a reason, contact the author through the bot, or ban the author from future submissions.
 - Owner-only settings menu in private chat via `/settings`.
 - Public users only need `/start` and `/stats`.
 - Russian and English public/moderation texts per registered bot.
 - Optional OpenAI or Gemini analysis for text and image submissions.
 - Optional AI fallback: after the voting timeout, AI can auto-approve only when its initial verdict is `publish`, the score is above the configured threshold, and moderators did not vote against the post.
 - Per-bot AI keys can be stored from the owner-only settings menu.
+- Local text/caption duplicate detection for recent submissions. This does not use AI tokens.
+- Prompt history with rollback for edited AI system prompts.
+- Owner health alerts for throttled operational failures.
 - Old finished moderation records are cleaned automatically.
 
 ## Requirements
@@ -101,7 +104,7 @@ The menu includes:
 - Start message: custom `/start` greeting.
 - Text limits.
 - Anti-spam: user submission limit per period.
-- Statistics.
+- Statistics: totals, queue, published, rejected, AI auto-approvals, average AI score, duplicates, and rejection reasons.
 
 Text commands still exist as shortcuts for the owner:
 
@@ -170,11 +173,19 @@ OpenAI model changes are checked with the current API key before saving. Gemini 
 The moderation message includes buttons for:
 
 - voting yes/no;
-- rejecting the submission immediately;
+- rejecting the submission with a reason: off-topic, low quality, AI-like, spam, no caption, or unsafe;
 - contacting the author through the bot;
 - banning the author.
 
-When a moderator clicks contact or ban, the bot asks for the next message in the moderator chat. `/cancel` cancels the pending action. A ban stores `banned_at` and `ban_reason`, blocks future submissions from that user, and closes their active not-yet-approved moderation records.
+When a moderator clicks reject, the bot asks for a reason and sends that reason to the author together with the AI analysis when available. When a moderator clicks contact or ban, the bot asks for the next message in the moderator chat. `/cancel` cancels the pending action. A ban stores `banned_at` and `ban_reason`, blocks future submissions from that user, and closes their active not-yet-approved moderation records.
+
+## Duplicate Detection
+
+Text and caption duplicates are detected locally from normalized recent submissions for the same registered bot. This uses PostgreSQL data only and does not spend AI tokens.
+
+When a possible duplicate is found, the moderation card shows a warning with the similarity score and previous message key. The bot does not auto-reject duplicates; moderators decide.
+
+Owners can change this in `/settings` -> `Duplicates`: enable or disable duplicate checks and adjust the lookback period in days.
 
 ## Moving Moderator Chat
 
@@ -239,6 +250,14 @@ Backup database volume before risky changes:
 ```bash
 docker compose exec postgres pg_dump -U boterator boterator > backup.sql
 ```
+
+Daily compressed backup helper:
+
+```bash
+scripts/backup-postgres.sh
+```
+
+By default it writes to `/opt/boterator/backups` and keeps 14 days. Override with `BACKUP_DIR`, `BACKUP_RETENTION_DAYS`, and `PROJECT_DIR`.
 
 ## Local Checks
 

@@ -42,8 +42,23 @@ CREATE TABLE IF NOT EXISTS incoming_messages (
     ai_recommendation TEXT,
     ai_publish_score INTEGER,
     ai_auto_approved BOOLEAN NOT NULL DEFAULT FALSE,
+    reject_reason TEXT,
+    rejected_by BIGINT,
+    rejected_at TIMESTAMPTZ,
+    normalized_text TEXT,
+    media_unique_id TEXT,
+    duplicate_of_original_chat_id BIGINT,
+    duplicate_of_message_id BIGINT,
+    duplicate_score INTEGER,
     published_message_id BIGINT,
     PRIMARY KEY (bot_id, original_chat_id, id)
+);
+
+CREATE TABLE IF NOT EXISTS ai_prompt_history (
+    id BIGSERIAL PRIMARY KEY,
+    bot_id BIGINT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    prompt TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS votes_history (
@@ -67,3 +82,10 @@ CREATE INDEX IF NOT EXISTS votes_history_mo_idx
     ON votes_history (bot_id, message_id, original_chat_id);
 CREATE UNIQUE INDEX IF NOT EXISTS votes_history_unique_vote_idx
     ON votes_history (bot_id, user_id, message_id, original_chat_id);
+CREATE INDEX IF NOT EXISTS im_normalized_text_idx
+    ON incoming_messages (bot_id, normalized_text);
+CREATE INDEX IF NOT EXISTS im_media_unique_id_idx
+    ON incoming_messages (bot_id, media_unique_id, created_at DESC)
+    WHERE media_unique_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS ai_prompt_history_bot_idx
+    ON ai_prompt_history (bot_id, created_at DESC);

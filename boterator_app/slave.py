@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 from datetime import timedelta
 from typing import Any
 
@@ -70,6 +71,22 @@ AI_ANALYSIS_TIMEOUT_SECONDS = 90
 AI_PROMPT_MAX_LENGTH = 3200
 BAN_REASON_MIN_LENGTH = 5
 CONTACT_MESSAGE_MAX_LENGTH = 3900
+DUPLICATE_DEFAULT_DAYS = 180
+DUPLICATE_MIN_DAYS = 1
+DUPLICATE_MAX_DAYS = 3650
+DUPLICATE_MIN_CHARS = 24
+DUPLICATE_MIN_WORDS = 5
+DUPLICATE_EXACT_SCORE = 100
+DUPLICATE_JACCARD_THRESHOLD = 88
+
+REJECT_REASONS = {
+    "off_topic": "Off-topic",
+    "low_quality": "Low quality",
+    "ai_like": "AI-like",
+    "spam": "Spam",
+    "no_caption": "No caption",
+    "unsafe": "Unsafe",
+}
 
 TOGGLE_LABELS = {
     "selfvote": "Самоголосование",
@@ -206,6 +223,7 @@ class SlaveRuntime:
         self.pending_start_text: set[int] = set()
         self.pending_contact: dict[int, tuple[int, int]] = {}
         self.pending_ban: dict[int, tuple[int, int, int]] = {}
+        self.health_alerts: dict[str, float] = {}
         self.task: asyncio.Task | None = None
         self.publisher_task: asyncio.Task | None = None
         self.timeout_task: asyncio.Task | None = None
@@ -238,6 +256,7 @@ class SlaveRuntime:
             raise
         except Exception:
             LOGGER.exception("Slave bot #%s stopped unexpectedly", self.bot_id)
+            await self._notify_health("polling", "⚠️ Slave bot polling stopped unexpectedly. The bot was marked inactive.")
             await self.pool.execute("UPDATE registered_bots SET active = FALSE WHERE id = $1", self.bot_id)
 
     def _register_handlers(self) -> None:
@@ -554,6 +573,10 @@ class SlaveRuntime:
         async def reject(callback: CallbackQuery) -> None:
             await self._handle_reject(callback)
 
+        @self.router.callback_query(F.data.startswith("rr|"))
+        async def reject_reason(callback: CallbackQuery) -> None:
+            await self._handle_reject_reason(callback)
+
         @self.router.callback_query(F.data.startswith("c|"))
         async def contact(callback: CallbackQuery) -> None:
             await self._handle_contact_request(callback)
@@ -584,7 +607,7 @@ class SlaveRuntime:
     async def _send_settings(self, message: Message, section: str = "main") -> None:
         await message.answer(
             await self._settings_text(section),
-            reply_markup=self._settings_keyboard(section),
+            reply_markup=await self._settings_keyboard(section),
         )
 
     async def _handle_settings_callback(self, callback: CallbackQuery) -> None:
@@ -622,6 +645,9 @@ class SlaveRuntime:
         elif action == "ai_score_adj" and len(parts) >= 3:
             await self._adjust_ai_auto_publish_score(int(parts[2]))
             section = "ai"
+        elif action == "duplicate_days_adj" and len(parts) >= 3:
+            await self._adjust_duplicate_detection_days(int(parts[2]))
+            section = "duplicates"
         elif action == "toggle" and len(parts) >= 4:
             target, section = parts[2], parts[-1]
             if target == "ai":
@@ -644,6 +670,8 @@ class SlaveRuntime:
                 await self._set_publish_mode(target.split(":", 1)[1])
             elif target.startswith("content:"):
                 await self._toggle_content_setting(target.split(":", 1)[1])
+            elif target == "duplicate_detection":
+                await self._set_duplicate_detection_enabled(not self._duplicate_detection_enabled())
             else:
                 await self._toggle_boolean_setting(target)
         elif action == "ai_key" and len(parts) >= 3:
@@ -698,6 +726,16 @@ class SlaveRuntime:
             self.pending_ai_prompt.discard(callback.from_user.id)
             await self._reset_ai_prompt()
             section = "ai_prompt"
+        elif action == "ai_prompt_rollback" and len(parts) >= 3:
+            try:
+                history_id = int(parts[2])
+            except ValueError:
+                await callback.answer()
+                return
+            ok = await self._rollback_ai_prompt(history_id)
+            section = "ai_prompt"
+            await callback.answer("✅ Prompt restored" if ok else "⚠️ Prompt not found", show_alert=not ok)
+            callback_answered = True
         elif action == "clear_ai":
             await self._clear_ai_key(None)
             section = "ai"
@@ -735,7 +773,7 @@ class SlaveRuntime:
 
         await self._edit_settings(callback, section)
         if not callback_answered:
-            if action in {"adj", "toggle", "freq_adj", "freq_preset", "freq_disable", "ai_score_adj"}:
+            if action in {"adj", "toggle", "freq_adj", "freq_preset", "freq_disable", "ai_score_adj", "duplicate_days_adj"}:
                 await callback.answer("✅ Сохранено")
             else:
                 await callback.answer()
@@ -746,7 +784,7 @@ class SlaveRuntime:
         try:
             await callback.message.edit_text(
                 await self._settings_text(section),
-                reply_markup=self._settings_keyboard(section),
+                reply_markup=await self._settings_keyboard(section),
             )
         except TelegramAPIError:
             LOGGER.debug("Unable to edit settings menu", exc_info=True)
@@ -794,6 +832,7 @@ class SlaveRuntime:
 
         if section == "ai_prompt":
             prompt = self._ai_full_prompt()
+            history = await self._prompt_history_preview()
             return (
                 "🧾 AI system prompt\n\n"
                 f"📌 Режим: {self._ai_prompt_state()}\n"
@@ -801,8 +840,20 @@ class SlaveRuntime:
                 "📄 Текущий полный prompt:\n"
                 f"{prompt}\n\n"
                 "✏️ При редактировании новый текст полностью заменит этот prompt. "
-                "Сохраняйте строку verdict/publish chance, если используете AI-автопубликацию."
+                "Сохраняйте строку verdict/publish chance, если используете AI-автопубликацию.\n\n"
+                f"{history}"
             )
+
+        if section == "ai_prompt_history":
+            rows = await self._recent_prompt_history()
+            if not rows:
+                return "🕓 История prompt\n\nПока нет сохраненных версий."
+            lines = ["🕓 История prompt", ""]
+            for row in rows:
+                created = row["created_at"].strftime("%Y-%m-%d %H:%M")
+                lines.append(f"#{row['id']} | {created}\n{_preview_text(row['prompt'], 260)}")
+                lines.append("")
+            return "\n".join(lines).rstrip()
 
         if section in {"ai_model", "ai_models_1m", "ai_models_10m", "ai_models_gemini"}:
             provider = self._ai_provider()
@@ -873,6 +924,17 @@ class SlaveRuntime:
                 "Если пользователь превысит лимит, бот не примет новое сообщение на модерацию."
             )
 
+        if section == "duplicates":
+            return (
+                "🔁 Проверка дублей\n\n"
+                f"📍 Статус: {_enabled_label(self._duplicate_detection_enabled())}\n"
+                f"🗓️ Период проверки: {self._duplicate_detection_days()} дн.\n"
+                f"🎯 Порог похожести: {DUPLICATE_JACCARD_THRESHOLD}%\n\n"
+                "Проверяются только текст и подписи к медиа внутри этого бота. "
+                "Это локальная проверка через PostgreSQL, без AI и без расхода токенов. "
+                "Найденный дубль не отклоняется автоматически: модераторы видят предупреждение и решают сами."
+            )
+
         if section == "start":
             mode = "стандартное" if self._start_text_is_default() else "свое"
             return (
@@ -886,6 +948,16 @@ class SlaveRuntime:
 
         if section == "stats":
             return await self._stats_text()
+
+        if section == "health":
+            return (
+                "🩺 Health и backup\n\n"
+                "✅ Уведомления владельцу включены для критичных runtime-ошибок: "
+                "падение polling, ошибки AI, недоступность чата модераторов и ошибки публикации.\n"
+                "💾 Daily backup PostgreSQL на сервере настроен cron-задачей. "
+                "По умолчанию файлы лежат в /opt/boterator/backups и хранятся 14 дней.\n\n"
+                "Если backup-скрипт запускается вручную, команда описана в README."
+            )
 
         enabled_content = [
             label
@@ -906,10 +978,11 @@ class SlaveRuntime:
             f"🌐 Язык публичных сообщений: {LANGUAGE_LABELS[self._language()]}\n"
             f"🤖 AI-анализ: {ai_state}\n"
             f"🚦 Лимит отправки: {_freq_limit_label(freq_limit) if freq_limit else 'выключен'}\n"
+            f"🔁 Проверка дублей: {_enabled_label(self._duplicate_detection_enabled())}, {self._duplicate_detection_days()} дн.\n"
             f"🧩 Разрешенный контент: {', '.join(enabled_content) if enabled_content else 'ничего'}"
         )
 
-    def _settings_keyboard(self, section: str) -> InlineKeyboardMarkup:
+    async def _settings_keyboard(self, section: str) -> InlineKeyboardMarkup:
         if section == "vote":
             return InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -972,10 +1045,20 @@ class SlaveRuntime:
             return InlineKeyboardMarkup(
                 inline_keyboard=[
                     [InlineKeyboardButton(text="✏️ Редактировать полный prompt", callback_data="s|ai_prompt_edit")],
+                    [InlineKeyboardButton(text="🕓 История / rollback", callback_data="s|nav|ai_prompt_history")],
                     [InlineKeyboardButton(text="🔄 Сбросить к дефолтному", callback_data="s|ai_prompt_reset")],
                     [InlineKeyboardButton(text="⬅️ Назад к AI", callback_data="s|nav|ai")],
                 ]
             )
+
+        if section == "ai_prompt_history":
+            rows = await self._recent_prompt_history()
+            buttons = [
+                [InlineKeyboardButton(text=f"↩️ Restore #{row['id']}", callback_data=f"s|ai_prompt_rollback|{row['id']}")]
+                for row in rows[:5]
+            ]
+            buttons.append([InlineKeyboardButton(text="⬅️ Назад к prompt", callback_data="s|nav|ai_prompt")])
+            return InlineKeyboardMarkup(inline_keyboard=buttons)
 
         if section == "ai_model":
             provider = self._ai_provider()
@@ -1063,6 +1146,24 @@ class SlaveRuntime:
                 ]
             )
 
+        if section == "duplicates":
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        _toggle_button(
+                            "🔁 Проверка дублей",
+                            "duplicate_detection",
+                            self._duplicate_detection_enabled(),
+                            "duplicates",
+                        )
+                    ],
+                    _duplicate_days_adjust_row("🗓️ 7 дн.", -7, 7),
+                    _duplicate_days_adjust_row("🗓️ 30 дн.", -30, 30),
+                    _duplicate_days_adjust_row("🗓️ 180 дн.", -180, 180),
+                    _back_row(),
+                ]
+            )
+
         if section == "start":
             return InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -1072,7 +1173,7 @@ class SlaveRuntime:
                 ]
             )
 
-        if section == "stats":
+        if section in {"stats", "health"}:
             return InlineKeyboardMarkup(inline_keyboard=[_back_row()])
 
         return InlineKeyboardMarkup(
@@ -1094,7 +1195,11 @@ class SlaveRuntime:
                     InlineKeyboardButton(text="🚦 Антиспам", callback_data="s|nav|freq"),
                 ],
                 [
+                    InlineKeyboardButton(text="🔁 Дубли", callback_data="s|nav|duplicates"),
                     InlineKeyboardButton(text="📊 Статистика", callback_data="s|nav|stats"),
+                ],
+                [
+                    InlineKeyboardButton(text="🩺 Backup/health", callback_data="s|nav|health"),
                 ],
                 [InlineKeyboardButton(text="✅ Закрыть", callback_data="s|close")],
             ]
@@ -1107,19 +1212,49 @@ class SlaveRuntime:
                 COUNT(*) AS total,
                 COUNT(*) FILTER (WHERE is_published) AS published,
                 COUNT(*) FILTER (WHERE is_voting_fail) AS rejected,
-                COUNT(*) FILTER (WHERE is_voting_success AND NOT is_published) AS queued
+                COUNT(*) FILTER (WHERE is_voting_success AND NOT is_published) AS queued,
+                COUNT(*) FILTER (
+                    WHERE NOT is_voting_fail
+                        AND NOT is_voting_success
+                        AND NOT is_published
+                ) AS review,
+                COUNT(*) FILTER (WHERE ai_auto_approved) AS auto_approved,
+                COUNT(*) FILTER (WHERE duplicate_score IS NOT NULL) AS duplicates,
+                ROUND(AVG(ai_publish_score) FILTER (WHERE ai_publish_score IS NOT NULL)) AS avg_ai_score
             FROM incoming_messages
             WHERE bot_id = $1
             """,
             self.bot_id,
         )
-        return (
-            "📊 Статистика\n\n"
-            f"📨 Всего: {row['total']}\n"
-            f"✅ Опубликовано: {row['published']}\n"
-            f"⏳ В очереди: {row['queued']}\n"
-            f"❌ Отклонено: {row['rejected']}"
+        reason_rows = await self.pool.fetch(
+            """
+            SELECT COALESCE(reject_reason, 'no_reason') AS reason, COUNT(*) AS count
+            FROM incoming_messages
+            WHERE bot_id = $1 AND is_voting_fail = TRUE
+            GROUP BY COALESCE(reject_reason, 'no_reason')
+            ORDER BY count DESC, reason
+            """,
+            self.bot_id,
         )
+        lines = [
+            "📊 Статистика",
+            "",
+            f"📨 Всего: {row['total']}",
+            f"🛡️ На модерации: {row['review']}",
+            f"⏳ Одобрено, ждет публикации: {row['queued']}",
+            f"✅ Опубликовано: {row['published']}",
+            f"🤖 Автоодобрено AI: {row['auto_approved']}",
+            f"❌ Отклонено: {row['rejected']}",
+            f"🔁 Возможные дубли: {row['duplicates']}",
+            f"🎯 Средний AI score: {int(row['avg_ai_score']) if row['avg_ai_score'] is not None else 'n/a'}%",
+        ]
+        if reason_rows:
+            lines.extend(["", "🚫 Причины отклонений:"])
+            for reason_row in reason_rows:
+                reason = reason_row["reason"]
+                label = "No reason" if reason == "no_reason" else (_reject_reason_label(reason) or str(reason))
+                lines.append(f"- {label}: {reason_row['count']}")
+        return "\n".join(lines)
 
     async def _user_stats_text(self, user_id: int) -> str:
         row = await self.pool.fetchrow(
@@ -1178,6 +1313,19 @@ class SlaveRuntime:
         count = max(1, min(FREQ_LIMIT_MAX_COUNT, int(count)))
         hours = max(1, min(FREQ_LIMIT_MAX_HOURS, int(hours)))
         await self._update_setting("msg_freq_limit", {"count": count, "hours": hours})
+
+    async def _set_duplicate_detection_enabled(self, enabled: bool) -> None:
+        duplicate_settings = dict(self.settings.get("duplicate_detection", {}))
+        duplicate_settings["enabled"] = enabled
+        duplicate_settings.setdefault("days", DUPLICATE_DEFAULT_DAYS)
+        await self._update_setting("duplicate_detection", duplicate_settings)
+
+    async def _adjust_duplicate_detection_days(self, delta: int) -> None:
+        duplicate_settings = dict(self.settings.get("duplicate_detection", {}))
+        value = self._duplicate_detection_days() + delta
+        duplicate_settings["days"] = max(DUPLICATE_MIN_DAYS, min(DUPLICATE_MAX_DAYS, value))
+        duplicate_settings.setdefault("enabled", self._duplicate_detection_enabled())
+        await self._update_setting("duplicate_detection", duplicate_settings)
 
     async def _toggle_content_setting(self, content_key: str) -> None:
         if content_key not in self.settings["content_status"]:
@@ -1268,6 +1416,7 @@ class SlaveRuntime:
         if len(prompt) > AI_PROMPT_MAX_LENGTH:
             return False, f"AI prompt слишком длинный. Максимум {AI_PROMPT_MAX_LENGTH} символов."
         ai_settings = dict(self.settings.get("ai", {}))
+        await self._save_current_prompt_history(ai_settings)
         ai_settings["system_prompt"] = prompt
         ai_settings["custom_prompt"] = None
         await self._update_setting("ai", ai_settings)
@@ -1275,9 +1424,75 @@ class SlaveRuntime:
 
     async def _reset_ai_prompt(self) -> None:
         ai_settings = dict(self.settings.get("ai", {}))
+        await self._save_current_prompt_history(ai_settings)
         ai_settings["system_prompt"] = None
         ai_settings["custom_prompt"] = None
         await self._update_setting("ai", ai_settings)
+
+    async def _save_current_prompt_history(self, ai_settings: dict[str, Any]) -> None:
+        prompt = ai_settings.get("system_prompt")
+        if not isinstance(prompt, str) or not prompt.strip():
+            return
+        prompt = prompt.strip()
+        last = await self.pool.fetchval(
+            """
+            SELECT prompt
+            FROM ai_prompt_history
+            WHERE bot_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            self.bot_id,
+        )
+        if last == prompt:
+            return
+        await self.pool.execute(
+            """
+            INSERT INTO ai_prompt_history (bot_id, prompt)
+            VALUES ($1, $2)
+            """,
+            self.bot_id,
+            prompt,
+        )
+
+    async def _recent_prompt_history(self) -> list[asyncpg.Record]:
+        rows = await self.pool.fetch(
+            """
+            SELECT id, created_at, prompt
+            FROM ai_prompt_history
+            WHERE bot_id = $1
+            ORDER BY created_at DESC
+            LIMIT 5
+            """,
+            self.bot_id,
+        )
+        return list(rows)
+
+    async def _prompt_history_preview(self) -> str:
+        rows = await self._recent_prompt_history()
+        if not rows:
+            return "🕓 История prompt: пусто"
+        latest = rows[0]["created_at"].strftime("%Y-%m-%d %H:%M")
+        return f"🕓 История prompt: {len(rows)} последних, свежая версия #{rows[0]['id']} от {latest}"
+
+    async def _rollback_ai_prompt(self, history_id: int) -> bool:
+        prompt = await self.pool.fetchval(
+            """
+            SELECT prompt
+            FROM ai_prompt_history
+            WHERE bot_id = $1 AND id = $2
+            """,
+            self.bot_id,
+            history_id,
+        )
+        if not prompt:
+            return False
+        ai_settings = dict(self.settings.get("ai", {}))
+        await self._save_current_prompt_history(ai_settings)
+        ai_settings["system_prompt"] = str(prompt)
+        ai_settings["custom_prompt"] = None
+        await self._update_setting("ai", ai_settings)
+        return True
 
     async def _handle_pending_ai_key(self, message: Message) -> bool:
         if not message.from_user or not self._can_manage(message):
@@ -1511,6 +1726,64 @@ class SlaveRuntime:
             return False
         return int(score) >= self._ai_auto_publish_min_score()
 
+    def _duplicate_detection_enabled(self) -> bool:
+        settings = self.settings.get("duplicate_detection", {})
+        if isinstance(settings, dict):
+            return bool(settings.get("enabled", True))
+        return True
+
+    def _duplicate_detection_days(self) -> int:
+        settings = self.settings.get("duplicate_detection", {})
+        if not isinstance(settings, dict):
+            return DUPLICATE_DEFAULT_DAYS
+        try:
+            value = int(settings.get("days", DUPLICATE_DEFAULT_DAYS))
+        except (TypeError, ValueError):
+            value = DUPLICATE_DEFAULT_DAYS
+        return max(DUPLICATE_MIN_DAYS, min(DUPLICATE_MAX_DAYS, value))
+
+    async def _find_duplicate(
+        self,
+        normalized_text: str | None,
+        original_chat_id: int,
+        message_id: int,
+    ) -> dict[str, int] | None:
+        if not self._duplicate_detection_enabled() or not normalized_text:
+            return None
+        if len(normalized_text) < DUPLICATE_MIN_CHARS:
+            return None
+
+        rows = await self.pool.fetch(
+            """
+            SELECT original_chat_id, id, normalized_text
+            FROM incoming_messages
+            WHERE bot_id = $1
+                AND normalized_text IS NOT NULL
+                AND created_at >= NOW() - ($2::int * interval '1 day')
+                AND NOT (original_chat_id = $3 AND id = $4)
+            ORDER BY created_at DESC
+            LIMIT 1000
+            """,
+            self.bot_id,
+            self._duplicate_detection_days(),
+            original_chat_id,
+            message_id,
+        )
+
+        best: dict[str, int] | None = None
+        for row in rows:
+            candidate = row["normalized_text"] or ""
+            score = _text_similarity_score(normalized_text, candidate)
+            if score >= DUPLICATE_JACCARD_THRESHOLD and (best is None or score > best["score"]):
+                best = {
+                    "original_chat_id": int(row["original_chat_id"]),
+                    "id": int(row["id"]),
+                    "score": score,
+                }
+                if score == DUPLICATE_EXACT_SCORE:
+                    break
+        return best
+
     async def _handle_incoming_message(self, message: Message) -> None:
         if _chat_type(message) != ChatType.PRIVATE.value:
             return
@@ -1577,6 +1850,8 @@ class SlaveRuntime:
         await callback.answer()
 
         raw_message = _message_dump(message)
+        normalized_text = _normalize_submission_text(message)
+        duplicate = await self._find_duplicate(normalized_text, message.chat.id, message.message_id)
         ai_enabled = self._ai_enabled()
         ai_provider = self._ai_provider() if ai_enabled else None
         ai_model = self._ai_model(ai_provider) if ai_provider else None
@@ -1585,9 +1860,10 @@ class SlaveRuntime:
             """
             INSERT INTO incoming_messages (
                 id, original_chat_id, owner_id, bot_id, message, ai_provider, ai_model, ai_analysis,
-                ai_recommendation, ai_publish_score, ai_auto_approved
+                ai_recommendation, ai_publish_score, ai_auto_approved, normalized_text,
+                duplicate_of_original_chat_id, duplicate_of_message_id, duplicate_score
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, $11, $12, $13, $14)
             ON CONFLICT (bot_id, original_chat_id, id) DO UPDATE SET
                 message = EXCLUDED.message,
                 ai_provider = EXCLUDED.ai_provider,
@@ -1595,7 +1871,14 @@ class SlaveRuntime:
                 ai_analysis = EXCLUDED.ai_analysis,
                 ai_recommendation = EXCLUDED.ai_recommendation,
                 ai_publish_score = EXCLUDED.ai_publish_score,
+                normalized_text = EXCLUDED.normalized_text,
+                duplicate_of_original_chat_id = EXCLUDED.duplicate_of_original_chat_id,
+                duplicate_of_message_id = EXCLUDED.duplicate_of_message_id,
+                duplicate_score = EXCLUDED.duplicate_score,
                 ai_auto_approved = FALSE,
+                reject_reason = NULL,
+                rejected_by = NULL,
+                rejected_at = NULL,
                 is_voting_fail = FALSE,
                 is_voting_success = FALSE,
                 is_published = FALSE
@@ -1610,6 +1893,10 @@ class SlaveRuntime:
             None,
             None,
             None,
+            normalized_text,
+            duplicate["original_chat_id"] if duplicate else None,
+            duplicate["id"] if duplicate else None,
+            duplicate["score"] if duplicate else None,
         )
 
         try:
@@ -1619,6 +1906,10 @@ class SlaveRuntime:
             moderation_status = await self._send_moderation_status(status_text, keyboard, moderation_fwd_id)
         except TelegramAPIError:
             LOGGER.exception("Unable to send moderation request for bot #%s", self.bot_id)
+            await self._notify_health(
+                "moderation_send",
+                "⚠️ Could not send a submission to the moderator chat. Check bot permissions and moderator chat.",
+            )
             await self.pool.execute(
                 "UPDATE incoming_messages SET is_voting_fail = TRUE WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3",
                 self.bot_id,
@@ -1681,6 +1972,7 @@ class SlaveRuntime:
                 message_id,
             )
             ai_result = None
+            await self._notify_health("ai_timeout", "⚠️ AI analysis timed out. Moderation still works, but AI result is missing.")
         except Exception:
             LOGGER.exception(
                 "AI analysis task failed for bot #%s message #%s/%s",
@@ -1689,6 +1981,7 @@ class SlaveRuntime:
                 message_id,
             )
             ai_result = None
+            await self._notify_health("ai_failed", "⚠️ AI analysis failed. Moderation still works, but AI result is missing.")
 
         analysis_text = ai_result.text if ai_result else self._t("ai_analysis_failed")
         try:
@@ -1799,12 +2092,16 @@ class SlaveRuntime:
                 await conn.execute(
                     """
                     UPDATE incoming_messages
-                    SET is_voting_fail = TRUE
+                    SET is_voting_fail = TRUE,
+                        reject_reason = COALESCE(reject_reason, 'no_vote'),
+                        rejected_by = COALESCE(rejected_by, $4),
+                        rejected_at = COALESCE(rejected_at, NOW())
                     WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3 AND is_voting_success = FALSE
                     """,
                     self.bot_id,
                     original_chat_id,
                     message_id,
+                    user_id,
                 )
                 await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
                 await callback.answer(self._t("vote_counted_rejected"))
@@ -1822,19 +2119,45 @@ class SlaveRuntime:
             await callback.answer()
             return
         original_chat_id, message_id = parsed
-        await self.pool.execute(
+        await callback.message.answer(
+            "🚫 Select rejection reason:",
+            reply_markup=_reject_reason_keyboard(original_chat_id, message_id),
+            reply_to_message_id=callback.message.message_id,
+        )
+        await callback.answer()
+
+    async def _handle_reject_reason(self, callback: CallbackQuery) -> None:
+        parsed = _parse_reject_reason_callback(callback.data)
+        if not parsed or not callback.message or callback.message.chat.id != self.moderator_chat_id:
+            await callback.answer()
+            return
+        original_chat_id, message_id, reason = parsed
+        row = await self.pool.fetchrow(
             """
             UPDATE incoming_messages
-            SET is_voting_fail = TRUE
+            SET is_voting_fail = TRUE,
+                reject_reason = $4,
+                rejected_by = $5,
+                rejected_at = NOW()
             WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
-                AND is_published = FALSE AND is_voting_success = FALSE
+                AND is_published = FALSE AND is_voting_success = FALSE AND is_voting_fail = FALSE
+            RETURNING id
             """,
             self.bot_id,
             original_chat_id,
             message_id,
+            reason,
+            callback.from_user.id,
         )
+        if not row:
+            await callback.answer("⚠️ Message is already finished.", show_alert=True)
+            return
         await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
         await self._refresh_moderation_status(original_chat_id, message_id, True)
+        try:
+            await callback.message.edit_text(f"🚫 Rejected: {REJECT_REASONS.get(reason, reason)}")
+        except TelegramAPIError:
+            LOGGER.debug("Unable to edit reject reason message", exc_info=True)
         await callback.answer(self._t("message_rejected"))
 
     async def _handle_contact_request(self, callback: CallbackQuery) -> None:
@@ -2014,6 +2337,10 @@ class SlaveRuntime:
                 published = await self._copy_or_forward(self.target_channel, row["original_chat_id"], row["id"])
             except TelegramAPIError:
                 LOGGER.exception("Publishing failed for bot #%s message #%s", self.bot_id, row["id"])
+                await self._notify_health(
+                    "publish_failed",
+                    "⚠️ Publishing failed. Check that the bot is an admin in the target channel.",
+                )
                 return
 
             await self.pool.execute(
@@ -2152,7 +2479,9 @@ class SlaveRuntime:
                 updated = await conn.fetchrow(
                     """
                     UPDATE incoming_messages
-                    SET is_voting_fail = TRUE
+                    SET is_voting_fail = TRUE,
+                        reject_reason = COALESCE(reject_reason, 'timeout'),
+                        rejected_at = COALESCE(rejected_at, NOW())
                     WHERE bot_id = $1
                         AND original_chat_id = $2
                         AND id = $3
@@ -2228,7 +2557,11 @@ class SlaveRuntime:
                     ai_analysis,
                     ai_recommendation,
                     ai_publish_score,
-                    ai_auto_approved
+                    ai_auto_approved,
+                    duplicate_of_original_chat_id,
+                    duplicate_of_message_id,
+                    duplicate_score,
+                    reject_reason
                 FROM incoming_messages
                 WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
                 """,
@@ -2256,6 +2589,18 @@ class SlaveRuntime:
                 ]
             )
 
+        if row and row["duplicate_score"]:
+            lines.extend(
+                [
+                    "",
+                    "🔁 "
+                    + _html(
+                        f"Possible duplicate: {row['duplicate_score']}% similar to "
+                        f"{row['duplicate_of_original_chat_id']}/{row['duplicate_of_message_id']}"
+                    ),
+                ]
+            )
+
         if finished and row:
             if row["is_published"]:
                 lines.extend(["", _html(self._t("status_published"))])
@@ -2265,6 +2610,9 @@ class SlaveRuntime:
                 lines.extend(["", _html(self._t("status_approved_waiting"))])
             elif row["is_voting_fail"]:
                 lines.extend(["", _html(self._t("status_rejected"))])
+                reason_label = _reject_reason_label(row["reject_reason"])
+                if reason_label:
+                    lines.append("🚫 " + _html(f"Reason: {reason_label}"))
             else:
                 lines.extend(["", _html(self._t("status_closed"))])
             return "\n".join(lines), None
@@ -2392,10 +2740,24 @@ class SlaveRuntime:
         except TelegramAPIError:
             LOGGER.debug("Unable to notify author", exc_info=True)
 
+    async def _notify_owner(self, text: str) -> None:
+        try:
+            await self.bot.send_message(self.owner_id, text)
+        except TelegramAPIError:
+            LOGGER.debug("Unable to notify owner", exc_info=True)
+
+    async def _notify_health(self, key: str, text: str, throttle_seconds: int = 3600) -> None:
+        now = time.monotonic()
+        last = self.health_alerts.get(key, 0)
+        if now - last < throttle_seconds:
+            return
+        self.health_alerts[key] = now
+        await self._notify_owner(f"🩺 Health alert for bot #{self.bot_id}\n\n{text}")
+
     async def _notify_rejection_author(self, chat_id: int, message_id: int, base_key: str) -> None:
-        analysis = await self.pool.fetchval(
+        row = await self.pool.fetchrow(
             """
-            SELECT ai_analysis
+            SELECT ai_analysis, reject_reason
             FROM incoming_messages
             WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
             """,
@@ -2403,11 +2765,16 @@ class SlaveRuntime:
             chat_id,
             message_id,
         )
+        analysis = row["ai_analysis"] if row else None
+        reason = row["reject_reason"] if row else None
         analysis = str(analysis or "").strip()
+        reason_label = _reject_reason_label(reason)
         if analysis:
             text = self._t(f"{base_key}_with_ai", analysis=_preview_text(analysis, 1400))
         else:
             text = self._t(base_key)
+        if reason_label:
+            text = f"{text}\n\n🚫 Reason: {reason_label}"
         await self._notify_author(chat_id, message_id, text)
 
     async def _moderation_action_row(self, original_chat_id: int, message_id: int) -> asyncpg.Record | None:
@@ -2651,6 +3018,59 @@ def _single_line(value: Any, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
+def _reject_reason_label(reason: Any) -> str | None:
+    if not reason:
+        return None
+    reason = str(reason)
+    if reason == "no_vote":
+        return "Moderator no vote"
+    if reason == "timeout":
+        return "Voting timeout"
+    return REJECT_REASONS.get(reason, reason.replace("_", " ").title())
+
+
+def _reject_reason_keyboard(original_chat_id: int, message_id: int) -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(
+            text=f"🚫 {label}",
+            callback_data=f"rr|{original_chat_id}|{message_id}|{key}",
+        )
+        for key, label in REJECT_REASONS.items()
+    ]
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _normalize_submission_text(message: Message) -> str | None:
+    text = message.text or message.caption or ""
+    normalized = _normalize_text(text)
+    return normalized or None
+
+
+def _normalize_text(value: str) -> str:
+    value = value.lower()
+    value = re.sub(r"https?://\S+|t\.me/\S+|@\w+", " ", value)
+    value = re.sub(r"[^\w\s']", " ", value, flags=re.UNICODE)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value
+
+
+def _text_similarity_score(left: str, right: str) -> int:
+    if not left or not right:
+        return 0
+    if left == right:
+        return DUPLICATE_EXACT_SCORE
+
+    left_words = set(left.split())
+    right_words = set(right.split())
+    if len(left_words) < DUPLICATE_MIN_WORDS or len(right_words) < DUPLICATE_MIN_WORDS:
+        return 0
+    union = left_words | right_words
+    if not union:
+        return 0
+    return round(100 * len(left_words & right_words) / len(union))
+
+
 def _freq_limit_label(limit: tuple[int, int]) -> str:
     count, hours = limit
     return f"{count} сообщений за {hours} ч."
@@ -2695,6 +3115,13 @@ def _freq_adjust_row(label: str, field: str, minus_delta: int, plus_delta: int) 
     return [
         InlineKeyboardButton(text=f"➖ {label}", callback_data=f"s|freq_adj|{field}|{minus_delta}"),
         InlineKeyboardButton(text=f"➕ {label}", callback_data=f"s|freq_adj|{field}|{plus_delta}"),
+    ]
+
+
+def _duplicate_days_adjust_row(label: str, minus_delta: int, plus_delta: int) -> list[InlineKeyboardButton]:
+    return [
+        InlineKeyboardButton(text=f"➖ {label}", callback_data=f"s|duplicate_days_adj|{minus_delta}"),
+        InlineKeyboardButton(text=f"➕ {label}", callback_data=f"s|duplicate_days_adj|{plus_delta}"),
     ]
 
 
@@ -2764,6 +3191,18 @@ def _parse_reject_callback(data: str | None) -> tuple[int, int] | None:
         return None
     try:
         return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+
+
+def _parse_reject_reason_callback(data: str | None) -> tuple[int, int, str] | None:
+    if not data:
+        return None
+    parts = data.split("|")
+    if len(parts) != 4 or parts[0] != "rr" or parts[3] not in REJECT_REASONS:
+        return None
+    try:
+        return int(parts[1]), int(parts[2]), parts[3]
     except ValueError:
         return None
 
