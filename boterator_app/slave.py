@@ -71,6 +71,7 @@ AI_ANALYSIS_TIMEOUT_SECONDS = 90
 AI_PROMPT_MAX_LENGTH = 3200
 BAN_REASON_MIN_LENGTH = 5
 CONTACT_MESSAGE_MAX_LENGTH = 3900
+REJECT_NOTE_MAX_LENGTH = 1200
 DUPLICATE_DEFAULT_DAYS = 180
 DUPLICATE_MIN_DAYS = 1
 DUPLICATE_MAX_DAYS = 3650
@@ -80,6 +81,7 @@ DUPLICATE_EXACT_SCORE = 100
 DUPLICATE_JACCARD_THRESHOLD = 88
 
 REJECT_REASONS = {
+    "silent": "No public reason",
     "off_topic": "Off-topic",
     "low_quality": "Low quality",
     "ai_like": "AI-like",
@@ -87,6 +89,73 @@ REJECT_REASONS = {
     "no_caption": "No caption",
     "unsafe": "Unsafe",
 }
+
+AUTO_FILTER_REASONS = {
+    "auto_link": "Link detected",
+    "auto_profanity": "Strong profanity detected",
+    "auto_test": "Test/placeholder detected",
+}
+
+REJECT_REASON_LABELS = {
+    "ru": {
+        "silent": "Без публичной причины",
+        "off_topic": "Не по теме канала",
+        "low_quality": "Низкое качество",
+        "ai_like": "Похоже на сгенерированный или шаблонный текст",
+        "spam": "Спам",
+        "no_caption": "Нет подписи",
+        "unsafe": "Небезопасный контент",
+        "no_vote": "Отклонено модераторами",
+        "timeout": "Не одобрено за время модерации",
+        "ai_reject": "AI предложил отклонить",
+        "custom": "Комментарий модератора",
+        "auto_link": "Обнаружена ссылка",
+        "auto_profanity": "Обнаружена грубая лексика",
+        "auto_test": "Тестовое сообщение",
+    },
+    "en": {
+        "silent": "No public reason",
+        "off_topic": "Off-topic",
+        "low_quality": "Low quality",
+        "ai_like": "AI-like",
+        "spam": "Spam",
+        "no_caption": "No caption",
+        "unsafe": "Unsafe",
+        "no_vote": "Rejected by moderators",
+        "timeout": "Not approved during moderation",
+        "ai_reject": "AI suggested rejection",
+        "custom": "Moderator note",
+        "auto_link": "Link detected",
+        "auto_profanity": "Strong profanity detected",
+        "auto_test": "Test/placeholder detected",
+    },
+}
+
+AUTO_FILTER_MODES = ("off", "flag", "reject")
+AUTO_FILTER_NEXT_MODE = {
+    "off": "flag",
+    "flag": "reject",
+    "reject": "off",
+}
+
+AUTHOR_HIDDEN_REJECT_REASONS = {"silent", "no_vote", "timeout", "ai_reject"}
+
+LINK_RE = re.compile(
+    r"(?i)(https?://|www\.|t\.me/|telegram\.me/|discord\.gg/|"
+    r"\b[\w.-]+\.(?:com|net|org|ru|io|me|ly|app|site|online|xyz|info|co)\b)"
+)
+EN_PROFANITY_RE = re.compile(r"(?i)\b(fuck|shit|bitch|cunt|dick|asshole|motherfucker)\b")
+RU_PROFANITY_RE = re.compile(
+    r"(?iu)\b("
+    r"[её]б\w*|"
+    r"х[уy][йеёяюи]\w*|"
+    r"п[ие]зд\w*|"
+    r"бл[яэ](д\w*|т\w*)|"
+    r"сука|"
+    r"муд[ао]к\w*|"
+    r"залуп\w*"
+    r")\b"
+)
 
 TOGGLE_LABELS = {
     "selfvote": "Самоголосование",
@@ -223,6 +292,7 @@ class SlaveRuntime:
         self.pending_start_text: set[int] = set()
         self.pending_contact: dict[int, tuple[int, int]] = {}
         self.pending_ban: dict[int, tuple[int, int, int]] = {}
+        self.pending_reject_note: dict[int, tuple[int, int]] = {}
         self.health_alerts: dict[str, float] = {}
         self.task: asyncio.Task | None = None
         self.publisher_task: asyncio.Task | None = None
@@ -648,6 +718,9 @@ class SlaveRuntime:
         elif action == "duplicate_days_adj" and len(parts) >= 3:
             await self._adjust_duplicate_detection_days(int(parts[2]))
             section = "duplicates"
+        elif action == "auto_reject_rule" and len(parts) >= 3:
+            await self._cycle_auto_reject_rule(parts[2])
+            section = "auto_reject"
         elif action == "toggle" and len(parts) >= 4:
             target, section = parts[2], parts[-1]
             if target == "ai":
@@ -672,6 +745,8 @@ class SlaveRuntime:
                 await self._toggle_content_setting(target.split(":", 1)[1])
             elif target == "duplicate_detection":
                 await self._set_duplicate_detection_enabled(not self._duplicate_detection_enabled())
+            elif target == "auto_reject":
+                await self._set_auto_reject_enabled(not self._auto_reject_enabled())
             else:
                 await self._toggle_boolean_setting(target)
         elif action == "ai_key" and len(parts) >= 3:
@@ -773,7 +848,16 @@ class SlaveRuntime:
 
         await self._edit_settings(callback, section)
         if not callback_answered:
-            if action in {"adj", "toggle", "freq_adj", "freq_preset", "freq_disable", "ai_score_adj", "duplicate_days_adj"}:
+            if action in {
+                "adj",
+                "toggle",
+                "freq_adj",
+                "freq_preset",
+                "freq_disable",
+                "ai_score_adj",
+                "duplicate_days_adj",
+                "auto_reject_rule",
+            }:
                 await callback.answer("✅ Сохранено")
             else:
                 await callback.answer()
@@ -935,6 +1019,19 @@ class SlaveRuntime:
                 "Найденный дубль не отклоняется автоматически: модераторы видят предупреждение и решают сами."
             )
 
+        if section == "auto_reject":
+            settings = self._auto_reject_settings()
+            return (
+                "🧱 Автофильтр\n\n"
+                f"📍 Статус: {_enabled_label(self._auto_reject_enabled())}\n"
+                f"🔗 Ссылки: {_auto_filter_mode_label(settings['links'])}\n"
+                f"🤬 Жесткий мат: {_auto_filter_mode_label(settings['profanity'])}\n"
+                f"🧪 Тестовые сообщения: {_auto_filter_mode_label(settings['test'])}\n\n"
+                "Режим «пометить» только добавляет предупреждение в карточку модерации. "
+                "Режим «отклонять» пересылает сообщение модераторам, но сразу закрывает карточку как rejected. "
+                "AI для автоотклоненных заявок не запускается."
+            )
+
         if section == "start":
             mode = "стандартное" if self._start_text_is_default() else "свое"
             return (
@@ -979,6 +1076,7 @@ class SlaveRuntime:
             f"🤖 AI-анализ: {ai_state}\n"
             f"🚦 Лимит отправки: {_freq_limit_label(freq_limit) if freq_limit else 'выключен'}\n"
             f"🔁 Проверка дублей: {_enabled_label(self._duplicate_detection_enabled())}, {self._duplicate_detection_days()} дн.\n"
+            f"🧱 Автофильтр: {_enabled_label(self._auto_reject_enabled())}\n"
             f"🧩 Разрешенный контент: {', '.join(enabled_content) if enabled_content else 'ничего'}"
         )
 
@@ -1164,6 +1262,18 @@ class SlaveRuntime:
                 ]
             )
 
+        if section == "auto_reject":
+            settings = self._auto_reject_settings()
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [_toggle_button("🧱 Автофильтр", "auto_reject", settings["enabled"], "auto_reject")],
+                    [_auto_filter_mode_button("🔗 Ссылки", "links", settings["links"])],
+                    [_auto_filter_mode_button("🤬 Жесткий мат", "profanity", settings["profanity"])],
+                    [_auto_filter_mode_button("🧪 Тест/placeholder", "test", settings["test"])],
+                    _back_row(),
+                ]
+            )
+
         if section == "start":
             return InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -1196,9 +1306,10 @@ class SlaveRuntime:
                 ],
                 [
                     InlineKeyboardButton(text="🔁 Дубли", callback_data="s|nav|duplicates"),
-                    InlineKeyboardButton(text="📊 Статистика", callback_data="s|nav|stats"),
+                    InlineKeyboardButton(text="🧱 Автофильтр", callback_data="s|nav|auto_reject"),
                 ],
                 [
+                    InlineKeyboardButton(text="📊 Статистика", callback_data="s|nav|stats"),
                     InlineKeyboardButton(text="🩺 Backup/health", callback_data="s|nav|health"),
                 ],
                 [InlineKeyboardButton(text="✅ Закрыть", callback_data="s|close")],
@@ -1252,7 +1363,7 @@ class SlaveRuntime:
             lines.extend(["", "🚫 Причины отклонений:"])
             for reason_row in reason_rows:
                 reason = reason_row["reason"]
-                label = "No reason" if reason == "no_reason" else (_reject_reason_label(reason) or str(reason))
+                label = "No reason" if reason == "no_reason" else (_reject_reason_label(reason, self._language()) or str(reason))
                 lines.append(f"- {label}: {reason_row['count']}")
         return "\n".join(lines)
 
@@ -1326,6 +1437,18 @@ class SlaveRuntime:
         duplicate_settings["days"] = max(DUPLICATE_MIN_DAYS, min(DUPLICATE_MAX_DAYS, value))
         duplicate_settings.setdefault("enabled", self._duplicate_detection_enabled())
         await self._update_setting("duplicate_detection", duplicate_settings)
+
+    async def _set_auto_reject_enabled(self, enabled: bool) -> None:
+        settings = self._auto_reject_settings()
+        settings["enabled"] = enabled
+        await self._update_setting("auto_reject", settings)
+
+    async def _cycle_auto_reject_rule(self, rule: str) -> None:
+        if rule not in {"links", "profanity", "test"}:
+            return
+        settings = self._auto_reject_settings()
+        settings[rule] = AUTO_FILTER_NEXT_MODE[str(settings[rule])]
+        await self._update_setting("auto_reject", settings)
 
     async def _toggle_content_setting(self, content_key: str) -> None:
         if content_key not in self.settings["content_status"]:
@@ -1726,6 +1849,58 @@ class SlaveRuntime:
             return False
         return int(score) >= self._ai_auto_publish_min_score()
 
+    def _ai_rejection_reason_available(self, row: asyncpg.Record) -> bool:
+        if not self._ai_auto_publish_enabled():
+            return False
+        if not row["ai_analysis"]:
+            return False
+        recommendation = str(row["ai_recommendation"] or "")
+        return recommendation in {"reject", "review"}
+
+    def _ai_auto_publish_rule_text(self) -> str:
+        threshold = self._ai_auto_publish_min_score()
+        timeout = int(self.settings.get("vote_timeout", 24))
+        if self._language() == "en":
+            if not self._ai_auto_publish_enabled():
+                return "OFF - moderators decide."
+            return f"ON - after {timeout}h, publish only if AI verdict is publish and score >= {threshold}%."
+
+        state = "ВКЛ" if self._ai_auto_publish_enabled() else "ВЫКЛ"
+        if not self._ai_auto_publish_enabled():
+            return "ВЫКЛ - решают модераторы."
+        return f"{state} - через {timeout} ч. публикует только при AI-вердикте publish и >= {threshold}%."
+
+    def _ai_auto_publish_decision_text(self, row: asyncpg.Record, counts: dict[str, int]) -> str:
+        threshold = self._ai_auto_publish_min_score()
+        timeout = int(self.settings.get("vote_timeout", 24))
+        recommendation = str(row["ai_recommendation"] or "unknown")
+        score = row["ai_publish_score"]
+
+        if self._language() == "en":
+            if not self._ai_auto_publish_enabled():
+                return "OFF - moderators decide."
+            if counts.get("no", 0) > 0:
+                return f"NO - there is a No vote. Rule: publish + >= {threshold}% after {timeout}h."
+            if recommendation != "publish":
+                return f"NO - AI verdict is {recommendation}, not publish. Rule: publish + >= {threshold}%."
+            if score is None:
+                return f"NO - AI score is missing. Rule: publish + >= {threshold}%."
+            if int(score) < threshold:
+                return f"NO - {int(score)}% is below the {threshold}% threshold."
+            return f"YES - after {timeout}h, if no one votes No."
+
+        if not self._ai_auto_publish_enabled():
+            return "ВЫКЛ - решают модераторы."
+        if counts.get("no", 0) > 0:
+            return f"НЕТ - уже есть голос против. Правило: publish + >= {threshold}% через {timeout} ч."
+        if recommendation != "publish":
+            return f"НЕТ - AI-вердикт {recommendation}, а нужен publish. Правило: publish + >= {threshold}%."
+        if score is None:
+            return f"НЕТ - AI-процент не найден. Правило: publish + >= {threshold}%."
+        if int(score) < threshold:
+            return f"НЕТ - {int(score)}% ниже порога {threshold}%."
+        return f"ДА - через {timeout} ч., если никто не нажмет No."
+
     def _duplicate_detection_enabled(self) -> bool:
         settings = self.settings.get("duplicate_detection", {})
         if isinstance(settings, dict):
@@ -1741,6 +1916,39 @@ class SlaveRuntime:
         except (TypeError, ValueError):
             value = DUPLICATE_DEFAULT_DAYS
         return max(DUPLICATE_MIN_DAYS, min(DUPLICATE_MAX_DAYS, value))
+
+    def _auto_reject_settings(self) -> dict[str, bool | str]:
+        raw = self.settings.get("auto_reject", {})
+        settings: dict[str, bool | str] = {
+            "enabled": False,
+            "links": "reject",
+            "profanity": "flag",
+            "test": "reject",
+        }
+        if isinstance(raw, dict):
+            if "enabled" in raw:
+                settings["enabled"] = bool(raw["enabled"])
+            for key in ("links", "profanity", "test"):
+                if key in raw:
+                    settings[key] = _normalize_auto_filter_mode(raw[key])
+        return settings
+
+    def _auto_reject_enabled(self) -> bool:
+        return bool(self._auto_reject_settings()["enabled"])
+
+    def _auto_filter_match(self, message: Message, normalized_text: str | None) -> tuple[str, str] | None:
+        settings = self._auto_reject_settings()
+        if not settings["enabled"]:
+            return None
+
+        text = message.text or message.caption or ""
+        if settings["links"] != "off" and _contains_link(text):
+            return "auto_link", str(settings["links"])
+        if settings["profanity"] != "off" and _contains_strong_profanity(text):
+            return "auto_profanity", str(settings["profanity"])
+        if settings["test"] != "off" and _looks_like_test_submission(normalized_text or ""):
+            return "auto_test", str(settings["test"])
+        return None
 
     async def _find_duplicate(
         self,
@@ -1880,8 +2088,11 @@ class SlaveRuntime:
         raw_message = _message_dump(message)
         normalized_text = _normalize_submission_text(message)
         media_unique_id = _media_unique_id(message)
+        auto_filter_match = self._auto_filter_match(message, normalized_text)
+        auto_filter_reason = auto_filter_match[0] if auto_filter_match else None
+        auto_reject_reason = auto_filter_reason if auto_filter_match and auto_filter_match[1] == "reject" else None
         duplicate = await self._find_duplicate(normalized_text, media_unique_id, message.chat.id, message.message_id)
-        ai_enabled = self._ai_enabled()
+        ai_enabled = self._ai_enabled() and auto_reject_reason is None
         ai_provider = self._ai_provider() if ai_enabled else None
         ai_model = self._ai_model(ai_provider) if ai_provider else None
 
@@ -1890,9 +2101,13 @@ class SlaveRuntime:
             INSERT INTO incoming_messages (
                 id, original_chat_id, owner_id, bot_id, message, ai_provider, ai_model, ai_analysis,
                 ai_recommendation, ai_publish_score, ai_auto_approved, normalized_text, media_unique_id,
-                duplicate_of_original_chat_id, duplicate_of_message_id, duplicate_score
+                auto_filter_reason, duplicate_of_original_chat_id, duplicate_of_message_id, duplicate_score,
+                is_voting_fail, reject_reason, rejected_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, $11, $12, $13, $14, $15)
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, $11, $12, $13, $14, $15,
+                $16, $17, $18, CASE WHEN $17 THEN NOW() ELSE NULL END
+            )
             ON CONFLICT (bot_id, original_chat_id, id) DO UPDATE SET
                 message = EXCLUDED.message,
                 ai_provider = EXCLUDED.ai_provider,
@@ -1902,14 +2117,16 @@ class SlaveRuntime:
                 ai_publish_score = EXCLUDED.ai_publish_score,
                 normalized_text = EXCLUDED.normalized_text,
                 media_unique_id = EXCLUDED.media_unique_id,
+                auto_filter_reason = EXCLUDED.auto_filter_reason,
                 duplicate_of_original_chat_id = EXCLUDED.duplicate_of_original_chat_id,
                 duplicate_of_message_id = EXCLUDED.duplicate_of_message_id,
                 duplicate_score = EXCLUDED.duplicate_score,
                 ai_auto_approved = FALSE,
-                reject_reason = NULL,
+                reject_reason = EXCLUDED.reject_reason,
+                reject_note = NULL,
                 rejected_by = NULL,
-                rejected_at = NULL,
-                is_voting_fail = FALSE,
+                rejected_at = EXCLUDED.rejected_at,
+                is_voting_fail = EXCLUDED.is_voting_fail,
                 is_voting_success = FALSE,
                 is_published = FALSE
             """,
@@ -1925,15 +2142,22 @@ class SlaveRuntime:
             None,
             normalized_text,
             media_unique_id,
+            auto_filter_reason,
             duplicate["original_chat_id"] if duplicate else None,
             duplicate["id"] if duplicate else None,
             duplicate["score"] if duplicate else None,
+            auto_reject_reason is not None,
+            auto_reject_reason,
         )
 
         try:
             moderation_copy = await self._copy_or_forward(self.moderator_chat_id, message.chat.id, message.message_id)
             moderation_fwd_id = moderation_copy.message_id
-            status_text, keyboard = await self._verification_message(message.message_id, message.chat.id, False)
+            status_text, keyboard = await self._verification_message(
+                message.message_id,
+                message.chat.id,
+                auto_reject_reason is not None,
+            )
             moderation_status = await self._send_moderation_status(status_text, keyboard, moderation_fwd_id)
         except TelegramAPIError:
             LOGGER.exception("Unable to send moderation request for bot #%s", self.bot_id)
@@ -1970,6 +2194,9 @@ class SlaveRuntime:
         )
         if callback.message:
             await callback.message.edit_text(self._t("sent_to_moderation"))
+        if auto_reject_reason:
+            await self._notify_rejection_author(message.chat.id, message.message_id, "author_rejected")
+            return
         if ai_enabled:
             asyncio.create_task(
                 self._run_ai_analysis(message, message.chat.id, message.message_id, ai_provider, ai_model),
@@ -2151,8 +2378,8 @@ class SlaveRuntime:
             return
         original_chat_id, message_id = parsed
         await callback.message.answer(
-            "🚫 Select rejection reason:",
-            reply_markup=_reject_reason_keyboard(original_chat_id, message_id),
+            self._t("reject_reason_prompt"),
+            reply_markup=_reject_reason_keyboard(original_chat_id, message_id, self._language()),
             reply_to_message_id=callback.message.message_id,
         )
         await callback.answer()
@@ -2163,11 +2390,26 @@ class SlaveRuntime:
             await callback.answer()
             return
         original_chat_id, message_id, reason = parsed
+        if reason == "custom":
+            self.pending_contact.pop(callback.from_user.id, None)
+            self.pending_ban.pop(callback.from_user.id, None)
+            self.pending_reject_note[callback.from_user.id] = (original_chat_id, message_id)
+            row = await self._moderation_action_row(original_chat_id, message_id)
+            await self.bot.send_message(
+                self.moderator_chat_id,
+                self._t("reject_note_prompt"),
+                reply_to_message_id=(row["moderation_fwd_message_id"] if row else None) or callback.message.message_id,
+                reply_markup=ForceReply(selective=True),
+            )
+            await callback.answer()
+            return
+
         row = await self.pool.fetchrow(
             """
             UPDATE incoming_messages
             SET is_voting_fail = TRUE,
                 reject_reason = $4,
+                reject_note = NULL,
                 rejected_by = $5,
                 rejected_at = NOW()
             WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
@@ -2186,7 +2428,8 @@ class SlaveRuntime:
         await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
         await self._refresh_moderation_status(original_chat_id, message_id, True)
         try:
-            await callback.message.edit_text(f"🚫 Rejected: {REJECT_REASONS.get(reason, reason)}")
+            prefix = "Отклонено" if self._language() == "ru" else "Rejected"
+            await callback.message.edit_text(f"🚫 {prefix}: {_reject_reason_label(reason, self._language()) or reason}")
         except TelegramAPIError:
             LOGGER.debug("Unable to edit reject reason message", exc_info=True)
         await callback.answer(self._t("message_rejected"))
@@ -2203,6 +2446,7 @@ class SlaveRuntime:
             return
 
         self.pending_ban.pop(callback.from_user.id, None)
+        self.pending_reject_note.pop(callback.from_user.id, None)
         self.pending_contact[callback.from_user.id] = (original_chat_id, message_id)
         await self.bot.send_message(
             self.moderator_chat_id,
@@ -2235,6 +2479,7 @@ class SlaveRuntime:
             return
 
         self.pending_contact.pop(callback.from_user.id, None)
+        self.pending_reject_note.pop(callback.from_user.id, None)
         self.pending_ban[callback.from_user.id] = (target_user_id, original_chat_id, message_id)
         await self.bot.send_message(
             self.moderator_chat_id,
@@ -2251,14 +2496,61 @@ class SlaveRuntime:
         moderator_id = message.from_user.id
         contact_target = self.pending_contact.get(moderator_id)
         ban_target = self.pending_ban.get(moderator_id)
-        if not contact_target and not ban_target:
+        reject_target = self.pending_reject_note.get(moderator_id)
+        if not contact_target and not ban_target and not reject_target:
             return False
 
         text = (message.text or message.caption or "").strip()
         if text.startswith("/cancel"):
             self.pending_contact.pop(moderator_id, None)
             self.pending_ban.pop(moderator_id, None)
+            self.pending_reject_note.pop(moderator_id, None)
             await message.answer(self._t("moderator_action_cancelled"), reply_to_message_id=message.message_id)
+            return True
+
+        if reject_target:
+            if not text:
+                await message.answer(
+                    self._t("reject_note_empty"),
+                    reply_to_message_id=message.message_id,
+                    reply_markup=ForceReply(selective=True),
+                )
+                return True
+            if len(text) > REJECT_NOTE_MAX_LENGTH:
+                await message.answer(
+                    self._t("reject_note_too_long", max=REJECT_NOTE_MAX_LENGTH),
+                    reply_to_message_id=message.message_id,
+                    reply_markup=ForceReply(selective=True),
+                )
+                return True
+
+            original_chat_id, original_message_id = reject_target
+            row = await self.pool.fetchrow(
+                """
+                UPDATE incoming_messages
+                SET is_voting_fail = TRUE,
+                    reject_reason = 'custom',
+                    reject_note = $4,
+                    rejected_by = $5,
+                    rejected_at = NOW()
+                WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
+                    AND is_published = FALSE AND is_voting_success = FALSE AND is_voting_fail = FALSE
+                RETURNING id
+                """,
+                self.bot_id,
+                original_chat_id,
+                original_message_id,
+                text,
+                moderator_id,
+            )
+            self.pending_reject_note.pop(moderator_id, None)
+            if not row:
+                await message.answer("⚠️ Message is already finished.", reply_to_message_id=message.message_id)
+                return True
+
+            await self._notify_rejection_author(original_chat_id, original_message_id, "author_rejected")
+            await self._refresh_moderation_status(original_chat_id, original_message_id, True)
+            await message.answer(self._t("reject_note_done"), reply_to_message_id=message.message_id)
             return True
 
         if contact_target:
@@ -2469,7 +2761,7 @@ class SlaveRuntime:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT original_chat_id, id, ai_recommendation, ai_publish_score
+                SELECT original_chat_id, id, ai_analysis, ai_recommendation, ai_publish_score
                 FROM incoming_messages
                 WHERE bot_id = $1
                     AND is_voting_success = FALSE
@@ -2507,11 +2799,17 @@ class SlaveRuntime:
                         auto_approved.append(updated)
                     continue
 
+                reject_reason = "timeout"
+                if counts.get("no", 0) > 0:
+                    reject_reason = "no_vote"
+                elif self._ai_rejection_reason_available(row):
+                    reject_reason = "ai_reject"
+
                 updated = await conn.fetchrow(
                     """
                     UPDATE incoming_messages
                     SET is_voting_fail = TRUE,
-                        reject_reason = COALESCE(reject_reason, 'timeout'),
+                        reject_reason = COALESCE(reject_reason, $4),
                         rejected_at = COALESCE(rejected_at, NOW())
                     WHERE bot_id = $1
                         AND original_chat_id = $2
@@ -2524,6 +2822,7 @@ class SlaveRuntime:
                     self.bot_id,
                     row["original_chat_id"],
                     row["id"],
+                    reject_reason,
                 )
                 if updated:
                     expired.append(updated)
@@ -2589,10 +2888,12 @@ class SlaveRuntime:
                     ai_recommendation,
                     ai_publish_score,
                     ai_auto_approved,
+                    auto_filter_reason,
                     duplicate_of_original_chat_id,
                     duplicate_of_message_id,
                     duplicate_score,
-                    reject_reason
+                    reject_reason,
+                    reject_note
                 FROM incoming_messages
                 WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
                 """,
@@ -2610,13 +2911,32 @@ class SlaveRuntime:
         ]
 
         if row and row["ai_provider"] and not row["ai_analysis"]:
-            lines.extend(["", f"<i>{_html(self._t('ai_analysis_checking', provider=_ai_label(row)))}</i>"])
+            lines.extend(
+                [
+                    "",
+                    f"<b>{_html(self._t('ai_analysis_heading', provider=_ai_label(row)))}</b>",
+                    f"<blockquote><i>{_html(self._t('ai_analysis_checking_short'))}</i></blockquote>",
+                    f"<b>{_html(self._t('ai_auto_title'))}</b>",
+                    f"<blockquote>{_html(self._ai_auto_publish_rule_text())}</blockquote>",
+                ]
+            )
         elif row and row["ai_analysis"]:
             lines.extend(
                 [
                     "",
                     f"<b>{_html(self._t('ai_analysis_heading', provider=_ai_label(row)))}</b>",
                     f"<blockquote>{_html(row['ai_analysis'])}</blockquote>",
+                    f"<b>{_html(self._t('ai_auto_title'))}</b>",
+                    f"<blockquote>{_html(self._ai_auto_publish_decision_text(row, counts))}</blockquote>",
+                ]
+            )
+
+        if row and row["auto_filter_reason"]:
+            lines.extend(
+                [
+                    "",
+                    f"<b>{_html(self._t('auto_filter_title'))}</b>",
+                    f"<blockquote>{_html(_auto_filter_warning_text(row['auto_filter_reason'], self._language()))}</blockquote>",
                 ]
             )
 
@@ -2641,9 +2961,15 @@ class SlaveRuntime:
                 lines.extend(["", _html(self._t("status_approved_waiting"))])
             elif row["is_voting_fail"]:
                 lines.extend(["", _html(self._t("status_rejected"))])
-                reason_label = _reject_reason_label(row["reject_reason"])
-                if reason_label:
-                    lines.append("🚫 " + _html(f"Reason: {reason_label}"))
+                reason_label = _reject_reason_label(row["reject_reason"], self._language())
+                reason_text = _rejection_reason_text(row["reject_reason"], reason_label, row["reject_note"])
+                if reason_text:
+                    lines.extend(
+                        [
+                            f"<b>{_html(self._t('reject_reason_title'))}</b>",
+                            f"<blockquote>{_html(reason_text)}</blockquote>",
+                        ]
+                    )
             else:
                 lines.extend(["", _html(self._t("status_closed"))])
             return "\n".join(lines), None
@@ -2788,7 +3114,7 @@ class SlaveRuntime:
     async def _notify_rejection_author(self, chat_id: int, message_id: int, base_key: str) -> None:
         row = await self.pool.fetchrow(
             """
-            SELECT ai_analysis, reject_reason
+            SELECT reject_reason, reject_note, ai_analysis
             FROM incoming_messages
             WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
             """,
@@ -2796,16 +3122,17 @@ class SlaveRuntime:
             chat_id,
             message_id,
         )
-        analysis = row["ai_analysis"] if row else None
         reason = row["reject_reason"] if row else None
-        analysis = str(analysis or "").strip()
-        reason_label = _reject_reason_label(reason)
-        if analysis:
-            text = self._t(f"{base_key}_with_ai", analysis=_preview_text(analysis, 1400))
-        else:
-            text = self._t(base_key)
-        if reason_label:
-            text = f"{text}\n\n🚫 Reason: {reason_label}"
+        note = str(row["reject_note"] or "").strip() if row else ""
+        reason_label = _author_reject_reason_label(reason, self._language())
+        ai_reason = _public_ai_rejection_reason(row["ai_analysis"], self._language()) if reason == "ai_reject" and row else None
+        text = self._t(base_key)
+        if reason_label and not (str(reason) == "custom" and note):
+            text = f"{text}\n\n{self._t('author_reject_reason', reason=reason_label)}"
+        elif ai_reason:
+            text = f"{text}\n\n{self._t('author_reject_reason', reason=ai_reason)}"
+        if note:
+            text = f"{text}\n\n{self._t('author_reject_note', note=_preview_text(note, REJECT_NOTE_MAX_LENGTH))}"
         await self._notify_author(chat_id, message_id, text)
 
     async def _moderation_action_row(self, original_chat_id: int, message_id: int) -> asyncpg.Record | None:
@@ -2991,6 +3318,22 @@ def _enabled_label(value: bool) -> str:
     return "🟢 включено" if value else "⚪ выключено"
 
 
+def _normalize_auto_filter_mode(value: Any) -> str:
+    if isinstance(value, bool):
+        return "reject" if value else "off"
+    value = str(value or "").lower()
+    return value if value in AUTO_FILTER_MODES else "off"
+
+
+def _auto_filter_mode_label(mode: Any) -> str:
+    mode = _normalize_auto_filter_mode(mode)
+    if mode == "reject":
+        return "🚫 отклонять"
+    if mode == "flag":
+        return "⚠️ пометить"
+    return "⚪ выкл"
+
+
 def _preview_text(text: str, limit: int = 1200) -> str:
     if len(text) <= limit:
         return text
@@ -3049,26 +3392,130 @@ def _single_line(value: Any, limit: int) -> str:
     return text[: limit - 3].rstrip() + "..."
 
 
-def _reject_reason_label(reason: Any) -> str | None:
+def _reject_reason_label(reason: Any, language: str = "en") -> str | None:
     if not reason:
         return None
     reason = str(reason)
-    if reason == "no_vote":
-        return "Moderator no vote"
-    if reason == "timeout":
-        return "Voting timeout"
+    labels = REJECT_REASON_LABELS.get(language, REJECT_REASON_LABELS["en"])
+    if reason in labels:
+        return labels[reason]
     return REJECT_REASONS.get(reason, reason.replace("_", " ").title())
 
 
-def _reject_reason_keyboard(original_chat_id: int, message_id: int) -> InlineKeyboardMarkup:
+def _author_reject_reason_label(reason: Any, language: str = "en") -> str | None:
+    if not reason or str(reason) in AUTHOR_HIDDEN_REJECT_REASONS:
+        return None
+    return _reject_reason_label(reason, language)
+
+
+def _auto_filter_warning_text(reason: Any, language: str = "en") -> str:
+    label = _reject_reason_label(reason, language)
+    if language == "ru":
+        return f"{label}. Проверьте вручную." if label else "Фильтр сработал. Проверьте вручную."
+    return f"{label}. Please check manually." if label else "Filter matched. Please check manually."
+
+
+def _public_ai_rejection_reason(analysis: Any, language: str) -> str | None:
+    text = str(analysis or "").strip()
+    if not text:
+        return None
+
+    preferred: list[str] = []
+    fallback: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        normalized = _strip_leading_markers(line)
+        lower = normalized.lower()
+        if _mentions_ai_disclosure(lower):
+            continue
+
+        label, sep, details = normalized.partition(":")
+        label = label.strip().lower()
+        details = details.strip() if sep else normalized
+        details = _clean_public_reason_fragment(details)
+        if not details:
+            continue
+
+        if label in {"риски", "risk", "risks", "сигналы", "signal", "signals"}:
+            preferred.append(details)
+        elif label in {"вердикт", "verdict"} or "%" in details:
+            continue
+        else:
+            fallback.append(details)
+
+    reason = _clean_public_reason_fragment("; ".join((preferred or fallback)[:2]).strip())
+    if not reason:
+        if language == "en":
+            return "the submission does not fit the channel guidelines."
+        return "сообщение не подходит под правила канала."
+    return _preview_text(reason, 700)
+
+
+def _strip_leading_markers(value: str) -> str:
+    return re.sub(r"^[^\wА-Яа-яЁё]+", "", value).strip()
+
+
+def _clean_public_reason_fragment(value: str) -> str:
+    value = re.sub(r"\b\d{1,3}\s*%", "", value)
+    value = re.sub(r"\s+([,.;:])", r"\1", value)
+    value = re.sub(r"\s{2,}", " ", value)
+    return value.strip(" -|")
+
+
+def _mentions_ai_disclosure(value: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(ai|ai-written|artificial intelligence|machine-written|generated|llm)\b|ии|нейросет|искусственн|сгенер",
+            value,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _rejection_reason_text(reason: Any, reason_label: str | None, note: Any) -> str | None:
+    note_text = str(note or "").strip()
+    if str(reason) == "custom" and note_text:
+        return note_text
+    if reason_label and note_text:
+        return f"{reason_label}\n{note_text}"
+    return reason_label or note_text or None
+
+
+def _reject_reason_keyboard(original_chat_id: int, message_id: int, language: str = "en") -> InlineKeyboardMarkup:
+    if language == "ru":
+        silent_text = "🔕 Отклонить без причины"
+        custom_text = "✍️ Своя причина"
+    else:
+        silent_text = "🔕 Reject silently"
+        custom_text = "✍️ Reject + custom note"
+
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=silent_text,
+                callback_data=f"rr|{original_chat_id}|{message_id}|silent",
+            )
+        ]
+    ]
     buttons = [
         InlineKeyboardButton(
-            text=f"🚫 {label}",
+            text=f"🚫 {_reject_reason_label(key, language) or label}",
             callback_data=f"rr|{original_chat_id}|{message_id}|{key}",
         )
         for key, label in REJECT_REASONS.items()
+        if key != "silent"
     ]
-    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+    rows.extend(buttons[i : i + 2] for i in range(0, len(buttons), 2))
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=custom_text,
+                callback_data=f"rr|{original_chat_id}|{message_id}|custom",
+            )
+        ]
+    )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3098,6 +3545,30 @@ def _normalize_text(value: str) -> str:
     value = re.sub(r"[^\w\s']", " ", value, flags=re.UNICODE)
     value = re.sub(r"\s+", " ", value).strip()
     return value
+
+
+def _contains_link(value: str) -> bool:
+    return bool(value and LINK_RE.search(value))
+
+
+def _contains_strong_profanity(value: str) -> bool:
+    return bool(value and (EN_PROFANITY_RE.search(value) or RU_PROFANITY_RE.search(value)))
+
+
+def _looks_like_test_submission(normalized_text: str) -> bool:
+    text = normalized_text.strip()
+    if not text:
+        return False
+    test_values = {
+        "test",
+        "test message",
+        "testing",
+        "тест",
+        "тестовое сообщение",
+        "проверка",
+        "проверка связи",
+    }
+    return text in test_values
 
 
 def _text_similarity_score(left: str, right: str) -> int:
@@ -3134,6 +3605,13 @@ def _mode_button(label: str, mode: str, active_mode: str) -> InlineKeyboardButto
 def _language_button(label: str, language: str, active_language: str) -> InlineKeyboardButton:
     prefix = "✅ " if language == active_language else ""
     return InlineKeyboardButton(text=f"{prefix}{label}", callback_data=f"s|toggle|language:{language}|language")
+
+
+def _auto_filter_mode_button(label: str, rule: str, mode: Any) -> InlineKeyboardButton:
+    return InlineKeyboardButton(
+        text=f"{label}: {_auto_filter_mode_label(mode)}",
+        callback_data=f"s|auto_reject_rule|{rule}",
+    )
 
 
 def _ai_provider_button(label: str, provider: str, active_provider: str) -> InlineKeyboardButton:
@@ -3244,7 +3722,7 @@ def _parse_reject_reason_callback(data: str | None) -> tuple[int, int, str] | No
     if not data:
         return None
     parts = data.split("|")
-    if len(parts) != 4 or parts[0] != "rr" or parts[3] not in REJECT_REASONS:
+    if len(parts) != 4 or parts[0] != "rr" or (parts[3] not in REJECT_REASONS and parts[3] != "custom"):
         return None
     try:
         return int(parts[1]), int(parts[2]), parts[3]

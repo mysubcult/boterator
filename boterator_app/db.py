@@ -37,6 +37,12 @@ DEFAULT_SLAVE_SETTINGS: dict[str, Any] = {
         "enabled": True,
         "days": 180,
     },
+    "auto_reject": {
+        "enabled": False,
+        "links": "reject",
+        "profanity": "flag",
+        "test": "reject",
+    },
     "allow_vote_switch": False,
     "tag_polls": False,
     "ai": {
@@ -100,10 +106,12 @@ CREATE TABLE IF NOT EXISTS incoming_messages (
     ai_publish_score INTEGER,
     ai_auto_approved BOOLEAN NOT NULL DEFAULT FALSE,
     reject_reason TEXT,
+    reject_note TEXT,
     rejected_by BIGINT,
     rejected_at TIMESTAMPTZ,
     normalized_text TEXT,
     media_unique_id TEXT,
+    auto_filter_reason TEXT,
     duplicate_of_original_chat_id BIGINT,
     duplicate_of_message_id BIGINT,
     duplicate_score INTEGER,
@@ -135,10 +143,12 @@ ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_recommendation TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_publish_score INTEGER;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_auto_approved BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS reject_reason TEXT;
+ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS reject_note TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS rejected_by BIGINT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS normalized_text TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS media_unique_id TEXT;
+ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS auto_filter_reason TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS duplicate_of_original_chat_id BIGINT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS duplicate_of_message_id BIGINT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS duplicate_score INTEGER;

@@ -10,6 +10,7 @@ Boterator lets users submit posts to a bot, forwards the original Telegram messa
 - User submissions are forwarded to moderators and then forwarded to the channel, preserving the original sender header when Telegram allows it.
 - Inline moderator voting with configurable vote count, timeout, publish delay, and content types.
 - Moderator buttons to reject with a reason, contact the author through the bot, or ban the author from future submissions.
+- Optional per-bot auto-filter rules for links, strong profanity, and test submissions. Each rule can be off, warning-only, or auto-reject.
 - Owner-only settings menu in private chat via `/settings`.
 - Public users only need `/start` and `/stats`.
 - Russian and English public/moderation texts per registered bot.
@@ -173,11 +174,11 @@ OpenAI model changes are checked with the current API key before saving. Gemini 
 The moderation message includes buttons for:
 
 - voting yes/no;
-- rejecting the submission with a reason: off-topic, low quality, AI-like, spam, no caption, or unsafe;
+- rejecting the submission with a template reason or a custom moderator-written reason;
 - contacting the author through the bot;
 - banning the author.
 
-When a moderator clicks reject, the bot asks for a reason and sends that reason to the author together with the AI analysis when available. When a moderator clicks contact or ban, the bot asks for the next message in the moderator chat. `/cancel` cancels the pending action. A ban stores `banned_at` and `ban_reason`, blocks future submissions from that user, and closes their active not-yet-approved moderation records.
+When a moderator clicks reject, the bot asks for a reason. The author receives the standard rejection message plus the selected reason or custom moderator note. Raw AI analysis is shown only to moderators. If AI auto-publish is enabled and a timed-out submission is rejected by the AI decision, the author receives a neutral rejection reason derived from the AI analysis without AI labels or scores. When a moderator clicks contact or ban, the bot asks for the next message in the moderator chat. `/cancel` cancels the pending action. A ban stores `banned_at` and `ban_reason`, blocks future submissions from that user, and closes their active not-yet-approved moderation records.
 
 ## Duplicate Detection
 
@@ -186,6 +187,14 @@ Text and caption duplicates are detected locally from normalized recent submissi
 When a possible duplicate is found, the moderation card shows a warning with the similarity score and previous message key. The bot does not auto-reject duplicates; moderators decide.
 
 Owners can change this in `/settings` -> `Duplicates`: enable or disable duplicate checks and adjust the lookback period in days.
+
+## Auto Filter
+
+Owners can change `/settings` -> `Auto filter` per registered bot. Rules for links, strong profanity, and test/placeholder submissions support three modes:
+
+- `off`: do nothing;
+- `warning-only`: show a warning in the moderator card, but keep voting open;
+- `auto-reject`: forward the submission to moderators, close it as rejected, and skip AI analysis.
 
 ## Moving Moderator Chat
 
