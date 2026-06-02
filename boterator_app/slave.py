@@ -14,7 +14,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramMigrateToChat
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 
 from .ai import AiAnalyzer, build_system_prompt
 from .db import merge_settings
@@ -2282,6 +2282,7 @@ class SlaveRuntime:
             return
         original_chat_id, message_id, vote_yes = parsed
         user_id = callback.from_user.id
+        await self._remember_user_profile(callback.from_user)
 
         if not self.settings.get("selfvote") and int(original_chat_id) == user_id and user_id != self.moderator_chat_id:
             await callback.answer(self._t("self_vote_denied"), show_alert=True)
@@ -2390,6 +2391,7 @@ class SlaveRuntime:
             await callback.answer()
             return
         original_chat_id, message_id, reason = parsed
+        await self._remember_user_profile(callback.from_user)
         if reason == "custom":
             self.pending_contact.pop(callback.from_user.id, None)
             self.pending_ban.pop(callback.from_user.id, None)
@@ -2525,6 +2527,7 @@ class SlaveRuntime:
                 return True
 
             original_chat_id, original_message_id = reject_target
+            await self._remember_user_profile(message.from_user)
             row = await self.pool.fetchrow(
                 """
                 UPDATE incoming_messages
@@ -2876,26 +2879,34 @@ class SlaveRuntime:
     ) -> tuple[str, InlineKeyboardMarkup | None]:
         async with self.pool.acquire() as conn:
             counts = await self._vote_counts(conn, original_chat_id, message_id)
+            voters = await self._vote_voters(conn, original_chat_id, message_id)
             row = await conn.fetchrow(
                 """
                 SELECT
-                    is_voting_success,
-                    is_voting_fail,
-                    is_published,
-                    ai_provider,
-                    ai_model,
-                    ai_analysis,
-                    ai_recommendation,
-                    ai_publish_score,
-                    ai_auto_approved,
-                    auto_filter_reason,
-                    duplicate_of_original_chat_id,
-                    duplicate_of_message_id,
-                    duplicate_score,
-                    reject_reason,
-                    reject_note
-                FROM incoming_messages
-                WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
+                    messages.is_voting_success,
+                    messages.is_voting_fail,
+                    messages.is_published,
+                    messages.ai_provider,
+                    messages.ai_model,
+                    messages.ai_analysis,
+                    messages.ai_recommendation,
+                    messages.ai_publish_score,
+                    messages.ai_auto_approved,
+                    messages.auto_filter_reason,
+                    messages.duplicate_of_original_chat_id,
+                    messages.duplicate_of_message_id,
+                    messages.duplicate_score,
+                    messages.reject_reason,
+                    messages.reject_note,
+                    messages.rejected_by,
+                    rejected_users.first_name AS rejected_by_first_name,
+                    rejected_users.last_name AS rejected_by_last_name,
+                    rejected_users.username AS rejected_by_username
+                FROM incoming_messages messages
+                LEFT JOIN users rejected_users
+                    ON rejected_users.bot_id = messages.bot_id
+                    AND rejected_users.user_id = messages.rejected_by
+                WHERE messages.bot_id = $1 AND messages.original_chat_id = $2 AND messages.id = $3
                 """,
                 self.bot_id,
                 original_chat_id,
@@ -2909,6 +2920,7 @@ class SlaveRuntime:
             f"<b>{_html(self._t('moderation_title'))}</b>",
             _html(self._t("moderation_votes", yes=yes, no=no, total=total, needed=self.settings["votes"])),
         ]
+        lines.extend(_html(line) for line in _voter_lines(voters, self._language()))
 
         if row and row["ai_provider"] and not row["ai_analysis"]:
             lines.extend(
@@ -2954,13 +2966,19 @@ class SlaveRuntime:
 
         if finished and row:
             if row["is_published"]:
-                lines.extend(["", _html(self._t("status_published"))])
+                if row["ai_auto_approved"]:
+                    lines.extend(["", _html(self._t("status_ai_auto_published"))])
+                else:
+                    lines.extend(["", _html(self._t("status_published"))])
             elif row["ai_auto_approved"]:
                 lines.extend(["", _html(self._t("status_ai_auto_approved"))])
             elif row["is_voting_success"]:
                 lines.extend(["", _html(self._t("status_approved_waiting"))])
             elif row["is_voting_fail"]:
                 lines.extend(["", _html(self._t("status_rejected"))])
+                rejected_by = _rejected_by_label(row)
+                if rejected_by:
+                    lines.append(_html(self._t("rejected_by", moderator=rejected_by)))
                 reason_label = _reject_reason_label(row["reject_reason"], self._language())
                 reason_text = _rejection_reason_text(row["reject_reason"], reason_label, row["reject_note"])
                 if reason_text:
@@ -3090,6 +3108,31 @@ class SlaveRuntime:
             message_id,
         )
         return {"yes": row["yes"] or 0, "no": row["no"] or 0}
+
+    async def _vote_voters(self, conn: asyncpg.Connection, original_chat_id: int, message_id: int) -> dict[str, list[str]]:
+        rows = await conn.fetch(
+            """
+            SELECT
+                votes.vote_yes,
+                votes.user_id,
+                users.first_name,
+                users.last_name,
+                users.username
+            FROM votes_history votes
+            LEFT JOIN users
+                ON users.bot_id = votes.bot_id
+                AND users.user_id = votes.user_id
+            WHERE votes.bot_id = $1 AND votes.original_chat_id = $2 AND votes.message_id = $3
+            ORDER BY votes.created_at, votes.id
+            """,
+            self.bot_id,
+            original_chat_id,
+            message_id,
+        )
+        result: dict[str, list[str]] = {"yes": [], "no": []}
+        for row in rows:
+            result["yes" if row["vote_yes"] else "no"].append(_user_label(row))
+        return result
 
     async def _notify_author(self, chat_id: int, message_id: int, text: str) -> None:
         try:
@@ -3241,6 +3284,17 @@ class SlaveRuntime:
     async def _upsert_user(self, message: Message) -> bool:
         if not message.from_user:
             return False
+        await self._remember_user_profile(message.from_user)
+        banned = await self.pool.fetchval(
+            "SELECT banned_at IS NOT NULL FROM users WHERE bot_id = $1 AND user_id = $2",
+            self.bot_id,
+            message.from_user.id,
+        )
+        return not banned
+
+    async def _remember_user_profile(self, user: User | None) -> None:
+        if not user:
+            return
         await self.pool.execute(
             """
             INSERT INTO users (bot_id, user_id, first_name, last_name, username)
@@ -3252,17 +3306,11 @@ class SlaveRuntime:
                 updated_at = NOW()
             """,
             self.bot_id,
-            message.from_user.id,
-            message.from_user.first_name,
-            message.from_user.last_name,
-            message.from_user.username,
+            user.id,
+            user.first_name,
+            user.last_name,
+            user.username,
         )
-        banned = await self.pool.fetchval(
-            "SELECT banned_at IS NOT NULL FROM users WHERE bot_id = $1 AND user_id = $2",
-            self.bot_id,
-            message.from_user.id,
-        )
-        return not banned
 
     async def _update_setting(self, key: str, value: Any) -> None:
         self.settings[key] = value
@@ -3376,13 +3424,44 @@ def _ai_label(row: Any) -> str:
 
 
 def _user_label(row: Any) -> str:
-    username = row["username"]
+    return _format_user_label(row["user_id"], row["first_name"], row["last_name"], row["username"])
+
+
+def _rejected_by_label(row: Any) -> str | None:
+    user_id = row["rejected_by"]
+    if not user_id:
+        return None
+    return _format_user_label(
+        user_id,
+        row["rejected_by_first_name"],
+        row["rejected_by_last_name"],
+        row["rejected_by_username"],
+    )
+
+
+def _format_user_label(user_id: Any, first_name: Any, last_name: Any, username: Any) -> str:
     if username:
         return f"@{username}"
-    first_name = row["first_name"] or ""
-    last_name = row["last_name"] or ""
+    first_name = first_name or ""
+    last_name = last_name or ""
     full_name = f"{first_name} {last_name}".strip()
-    return full_name or f"id {row['user_id']}"
+    return full_name or f"id {user_id}"
+
+
+def _voter_lines(voters: dict[str, list[str]], language: str) -> list[str]:
+    lines: list[str] = []
+    if voters["yes"]:
+        lines.append(translate(language, "voters_yes", voters=_join_user_labels(voters["yes"])))
+    if voters["no"]:
+        lines.append(translate(language, "voters_no", voters=_join_user_labels(voters["no"])))
+    return lines
+
+
+def _join_user_labels(labels: list[str], limit: int = 8) -> str:
+    if len(labels) <= limit:
+        return ", ".join(labels)
+    visible = ", ".join(labels[:limit])
+    return f"{visible}, +{len(labels) - limit}"
 
 
 def _single_line(value: Any, limit: int) -> str:
