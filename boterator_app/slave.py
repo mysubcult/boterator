@@ -77,11 +77,13 @@ DUPLICATE_MIN_DAYS = 1
 DUPLICATE_MAX_DAYS = 3650
 DUPLICATE_MIN_CHARS = 24
 DUPLICATE_MIN_WORDS = 5
+DUPLICATE_CONTAINMENT_MIN_WORDS = 8
 DUPLICATE_EXACT_SCORE = 100
 DUPLICATE_JACCARD_THRESHOLD = 88
 
 REJECT_REASONS = {
     "silent": "No public reason",
+    "not_our_cup": "Not our cup of tea.",
     "off_topic": "Off-topic",
     "low_quality": "Low quality",
     "ai_like": "AI-like",
@@ -99,6 +101,7 @@ AUTO_FILTER_REASONS = {
 REJECT_REASON_LABELS = {
     "ru": {
         "silent": "Без публичной причины",
+        "not_our_cup": "Not our cup of tea.",
         "off_topic": "Не по теме канала",
         "low_quality": "Низкое качество",
         "ai_like": "Похоже на сгенерированный или шаблонный текст",
@@ -115,6 +118,7 @@ REJECT_REASON_LABELS = {
     },
     "en": {
         "silent": "No public reason",
+        "not_our_cup": "Not our cup of tea.",
         "off_topic": "Off-topic",
         "low_quality": "Low quality",
         "ai_like": "AI-like",
@@ -162,6 +166,7 @@ TOGGLE_LABELS = {
     "allow_vote_switch": "Смена голоса",
     "tag_polls": "Теги в голосованиях",
     "public_vote": "Публичный счет голосов",
+    "owner_rate_limit_bypass": "Владелец без лимита отправки",
 }
 
 PUBLISH_MODE_LABELS = {
@@ -292,7 +297,8 @@ class SlaveRuntime:
         self.pending_start_text: set[int] = set()
         self.pending_contact: dict[int, tuple[int, int]] = {}
         self.pending_ban: dict[int, tuple[int, int, int]] = {}
-        self.pending_reject_note: dict[int, tuple[int, int]] = {}
+        self.pending_reject_note: dict[int, tuple[int, int, int | None]] = {}
+        self.pending_shadow_mute_add: set[int] = set()
         self.health_alerts: dict[str, float] = {}
         self.task: asyncio.Task | None = None
         self.publisher_task: asyncio.Task | None = None
@@ -341,6 +347,28 @@ class SlaveRuntime:
             if not self._can_manage(message):
                 return
             await self._send_settings(message)
+
+        @self.router.message(Command("votemute"))
+        async def votemute_command(message: Message) -> None:
+            if not self._can_manage(message):
+                return
+            parts = (message.text or "").split(maxsplit=1)
+            if len(parts) != 2:
+                await message.answer("🔇 Использование: /votemute @username или /votemute 123456789")
+                return
+            ok, response = await self._add_shadow_muted_moderator(parts[1])
+            await message.answer(response)
+
+        @self.router.message(Command("voteunmute"))
+        async def voteunmute_command(message: Message) -> None:
+            if not self._can_manage(message):
+                return
+            parts = (message.text or "").split(maxsplit=1)
+            if len(parts) != 2:
+                await message.answer("🔊 Использование: /voteunmute @username или /voteunmute 123456789")
+                return
+            ok, response = await self._remove_shadow_muted_moderator(parts[1])
+            await message.answer(response)
 
         @self.router.message(Command("setmodchat", "setmoderators"))
         async def setmodchat(message: Message) -> None:
@@ -667,6 +695,8 @@ class SlaveRuntime:
                 return
             if await self._handle_pending_start_text(message):
                 return
+            if await self._handle_pending_shadow_mute_add(message):
+                return
             await self._handle_incoming_message(message)
 
     def _settings_entry_keyboard(self) -> InlineKeyboardMarkup:
@@ -721,6 +751,23 @@ class SlaveRuntime:
         elif action == "auto_reject_rule" and len(parts) >= 3:
             await self._cycle_auto_reject_rule(parts[2])
             section = "auto_reject"
+        elif action == "shadow_mute_add":
+            self.pending_ai_key.pop(callback.from_user.id, None)
+            self.pending_ai_model.pop(callback.from_user.id, None)
+            self.pending_ai_prompt.discard(callback.from_user.id)
+            self.pending_start_text.discard(callback.from_user.id)
+            self.pending_shadow_mute_add.add(callback.from_user.id)
+            section = "moderators"
+            await callback.message.answer(
+                "🔇 Пришлите username или Telegram ID модератора.\n\n"
+                "Примеры: @username или 123456789. Он останется в чате и будет видеть кнопки, "
+                "но его нажатия не будут учитываться."
+            )
+        elif action == "shadow_mute_remove" and len(parts) >= 3:
+            ok, response = await self._remove_shadow_muted_moderator("|".join(parts[2:]))
+            section = "moderators"
+            await callback.answer(response, show_alert=not ok)
+            callback_answered = True
         elif action == "toggle" and len(parts) >= 4:
             target, section = parts[2], parts[-1]
             if target == "ai":
@@ -972,6 +1019,22 @@ class SlaveRuntime:
                 "/setmodchat@username_бота от аккаунта владельца."
             )
 
+        if section == "moderators":
+            muted = self._shadow_muted_moderators()
+            lines = [
+                "🔇 Теневой запрет голосования",
+                "",
+                "Модератор остается в чате и видит кнопки, но его голос, отклонение, бан и контакт с автором игнорируются.",
+                "Никаких сообщений в чат модераторов об этом не отправляется.",
+                "",
+                f"Сейчас в списке: {len(muted)}",
+            ]
+            if muted:
+                lines.append("")
+                for index, moderator in enumerate(muted, start=1):
+                    lines.append(f"{index}. {self._shadow_mute_label(moderator)}")
+            return "\n".join(lines)
+
         if section == "language":
             language = self._language()
             return (
@@ -991,6 +1054,7 @@ class SlaveRuntime:
 
         if section == "freq":
             limit = self._freq_limit()
+            owner_bypass = self._owner_rate_limit_bypass_enabled()
             if limit:
                 status = "🟢 включено"
                 label = _freq_limit_label(limit)
@@ -1003,9 +1067,11 @@ class SlaveRuntime:
                 "🚦 Антиспам: лимит отправки\n\n"
                 f"📍 Статус: {status}\n"
                 f"📨 Сейчас: {label}\n"
+                f"👑 Владелец без лимита: {_enabled_label(owner_bypass)}\n"
                 f"🔢 Сообщений: {count}\n"
                 f"⏱️ Период: {hours} ч.\n\n"
-                "Если пользователь превысит лимит, бот не примет новое сообщение на модерацию."
+                "Если пользователь превысит лимит, бот не примет новое сообщение на модерацию. "
+                "Bypass владельца действует только на аккаунт владельца этого бота."
             )
 
         if section == "duplicates":
@@ -1075,6 +1141,7 @@ class SlaveRuntime:
             f"🌐 Язык публичных сообщений: {LANGUAGE_LABELS[self._language()]}\n"
             f"🤖 AI-анализ: {ai_state}\n"
             f"🚦 Лимит отправки: {_freq_limit_label(freq_limit) if freq_limit else 'выключен'}\n"
+            f"👑 Владелец без лимита: {_enabled_label(self._owner_rate_limit_bypass_enabled())}\n"
             f"🔁 Проверка дублей: {_enabled_label(self._duplicate_detection_enabled())}, {self._duplicate_detection_days()} дн.\n"
             f"🧱 Автофильтр: {_enabled_label(self._auto_reject_enabled())}\n"
             f"🧩 Разрешенный контент: {', '.join(enabled_content) if enabled_content else 'ничего'}"
@@ -1211,6 +1278,23 @@ class SlaveRuntime:
                 ]
             )
 
+        if section == "moderators":
+            muted = self._shadow_muted_moderators()
+            rows: list[list[InlineKeyboardButton]] = [
+                [InlineKeyboardButton(text="➕ Добавить запрет", callback_data="s|shadow_mute_add")],
+            ]
+            for moderator in muted[:20]:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"🗑️ {self._shadow_mute_label(moderator)}",
+                            callback_data=f"s|shadow_mute_remove|{self._shadow_mute_key(moderator)}",
+                        )
+                    ]
+                )
+            rows.append(_back_row())
+            return InlineKeyboardMarkup(inline_keyboard=rows)
+
         if section == "language":
             language = self._language()
             return InlineKeyboardMarkup(
@@ -1238,6 +1322,14 @@ class SlaveRuntime:
                     _freq_adjust_row("📨 Сообщения", "count", -1, 1),
                     _freq_adjust_row("⏱️ 1 час", "hours", -1, 1),
                     _freq_adjust_row("⏱️ 24 часа", "hours", -24, 24),
+                    [
+                        _toggle_button(
+                            "👑 Владелец без лимита",
+                            "owner_rate_limit_bypass",
+                            self._owner_rate_limit_bypass_enabled(),
+                            "freq",
+                        )
+                    ],
                     [InlineKeyboardButton(text="✅ 2 сообщения за 24 ч.", callback_data="s|freq_preset")],
                     [InlineKeyboardButton(text="🚫 Выключить лимит", callback_data="s|freq_disable")],
                     _back_row(),
@@ -1297,19 +1389,22 @@ class SlaveRuntime:
                     InlineKeyboardButton(text="🚀 Публикация", callback_data="s|nav|publish"),
                 ],
                 [
+                    InlineKeyboardButton(text="🔇 Модераторы", callback_data="s|nav|moderators"),
                     InlineKeyboardButton(text="🌐 Язык", callback_data="s|nav|language"),
+                ],
+                [
                     InlineKeyboardButton(text="👋 Приветствие", callback_data="s|nav|start"),
-                ],
-                [
                     InlineKeyboardButton(text="✍️ Лимиты текста", callback_data="s|nav|text"),
+                ],
+                [
                     InlineKeyboardButton(text="🚦 Антиспам", callback_data="s|nav|freq"),
-                ],
-                [
                     InlineKeyboardButton(text="🔁 Дубли", callback_data="s|nav|duplicates"),
-                    InlineKeyboardButton(text="🧱 Автофильтр", callback_data="s|nav|auto_reject"),
                 ],
                 [
+                    InlineKeyboardButton(text="🧱 Автофильтр", callback_data="s|nav|auto_reject"),
                     InlineKeyboardButton(text="📊 Статистика", callback_data="s|nav|stats"),
+                ],
+                [
                     InlineKeyboardButton(text="🩺 Backup/health", callback_data="s|nav|health"),
                 ],
                 [InlineKeyboardButton(text="✅ Закрыть", callback_data="s|close")],
@@ -1813,7 +1908,12 @@ class SlaveRuntime:
     def _ai_setting_enabled(self) -> bool:
         return bool(self.settings.get("ai", {}).get("enabled", False))
 
+    def _owner_rate_limit_bypass_enabled(self) -> bool:
+        return bool(self.settings.get("owner_rate_limit_bypass", True))
+
     async def _rate_limit_exceeded(self, user_id: int) -> bool:
+        if user_id == self.owner_id and self._owner_rate_limit_bypass_enabled():
+            return False
         limit = self._freq_limit()
         if not limit:
             return False
@@ -1920,7 +2020,7 @@ class SlaveRuntime:
     def _auto_reject_settings(self) -> dict[str, bool | str]:
         raw = self.settings.get("auto_reject", {})
         settings: dict[str, bool | str] = {
-            "enabled": False,
+            "enabled": True,
             "links": "reject",
             "profanity": "flag",
             "test": "reject",
@@ -1946,7 +2046,7 @@ class SlaveRuntime:
             return "auto_link", str(settings["links"])
         if settings["profanity"] != "off" and _contains_strong_profanity(text):
             return "auto_profanity", str(settings["profanity"])
-        if settings["test"] != "off" and _looks_like_test_submission(normalized_text or ""):
+        if settings["test"] != "off" and _looks_like_test_submission(text, normalized_text or ""):
             return "auto_test", str(settings["test"])
         return None
 
@@ -2284,6 +2384,10 @@ class SlaveRuntime:
         user_id = callback.from_user.id
         await self._remember_user_profile(callback.from_user)
 
+        if self._is_shadow_muted_moderator(callback.from_user):
+            await callback.answer()
+            return
+
         if not self.settings.get("selfvote") and int(original_chat_id) == user_id and user_id != self.moderator_chat_id:
             await callback.answer(self._t("self_vote_denied"), show_alert=True)
             return
@@ -2334,7 +2438,15 @@ class SlaveRuntime:
             )
 
             counts = await self._vote_counts(conn, original_chat_id, message_id)
-            if counts["yes"] >= self.settings["votes"]:
+            if counts["no"] >= self.settings["votes"]:
+                await self._send_reject_reason_prompt(
+                    callback.message,
+                    original_chat_id,
+                    message_id,
+                    required=True,
+                )
+                await callback.answer(self._t("reject_reason_required_short"), show_alert=True)
+            elif counts["yes"] >= self.settings["votes"]:
                 await conn.execute(
                     """
                     UPDATE incoming_messages
@@ -2347,29 +2459,13 @@ class SlaveRuntime:
                 )
                 await self._notify_author(original_chat_id, message_id, self._t("author_approved"))
                 await callback.answer(self._t("vote_counted_approved"))
-            elif counts["no"] >= self.settings["votes"]:
-                await conn.execute(
-                    """
-                    UPDATE incoming_messages
-                    SET is_voting_fail = TRUE,
-                        reject_reason = COALESCE(reject_reason, 'no_vote'),
-                        rejected_by = COALESCE(rejected_by, $4),
-                        rejected_at = COALESCE(rejected_at, NOW())
-                    WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3 AND is_voting_success = FALSE
-                    """,
-                    self.bot_id,
-                    original_chat_id,
-                    message_id,
-                    user_id,
-                )
-                await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
-                await callback.answer(self._t("vote_counted_rejected"))
             else:
                 await callback.answer(self._t("vote_counted"))
 
-        finished = counts["yes"] >= self.settings["votes"] or counts["no"] >= self.settings["votes"]
+        approved = counts["yes"] >= self.settings["votes"] and counts["no"] < self.settings["votes"]
+        finished = approved
         await self._refresh_moderation_status(original_chat_id, message_id, finished)
-        if counts["yes"] >= self.settings["votes"]:
+        if approved:
             await self.publish_ready_messages()
 
     async def _handle_reject(self, callback: CallbackQuery) -> None:
@@ -2377,17 +2473,33 @@ class SlaveRuntime:
         if not parsed or not callback.message or callback.message.chat.id != self.moderator_chat_id:
             await callback.answer()
             return
+        if self._is_shadow_muted_moderator(callback.from_user):
+            await callback.answer()
+            return
         original_chat_id, message_id = parsed
-        await callback.message.answer(
-            self._t("reject_reason_prompt"),
-            reply_markup=_reject_reason_keyboard(original_chat_id, message_id, self._language()),
-            reply_to_message_id=callback.message.message_id,
-        )
+        await self._send_reject_reason_prompt(callback.message, original_chat_id, message_id)
         await callback.answer()
+
+    async def _send_reject_reason_prompt(
+        self,
+        message: Message,
+        original_chat_id: int,
+        message_id: int,
+        *,
+        required: bool = False,
+    ) -> None:
+        await message.answer(
+            self._t("reject_reason_required_prompt" if required else "reject_reason_prompt"),
+            reply_markup=_reject_reason_keyboard(original_chat_id, message_id, self._language()),
+            reply_to_message_id=message.message_id,
+        )
 
     async def _handle_reject_reason(self, callback: CallbackQuery) -> None:
         parsed = _parse_reject_reason_callback(callback.data)
         if not parsed or not callback.message or callback.message.chat.id != self.moderator_chat_id:
+            await callback.answer()
+            return
+        if self._is_shadow_muted_moderator(callback.from_user):
             await callback.answer()
             return
         original_chat_id, message_id, reason = parsed
@@ -2395,14 +2507,19 @@ class SlaveRuntime:
         if reason == "custom":
             self.pending_contact.pop(callback.from_user.id, None)
             self.pending_ban.pop(callback.from_user.id, None)
-            self.pending_reject_note[callback.from_user.id] = (original_chat_id, message_id)
             row = await self._moderation_action_row(original_chat_id, message_id)
-            await self.bot.send_message(
+            prompt_message = await self.bot.send_message(
                 self.moderator_chat_id,
                 self._t("reject_note_prompt"),
                 reply_to_message_id=(row["moderation_fwd_message_id"] if row else None) or callback.message.message_id,
                 reply_markup=ForceReply(selective=True),
             )
+            self.pending_reject_note[callback.from_user.id] = (
+                original_chat_id,
+                message_id,
+                prompt_message.message_id,
+            )
+            await self._delete_message_safely(callback.message.chat.id, callback.message.message_id)
             await callback.answer()
             return
 
@@ -2425,20 +2542,20 @@ class SlaveRuntime:
             callback.from_user.id,
         )
         if not row:
+            await self._delete_message_safely(callback.message.chat.id, callback.message.message_id)
             await callback.answer("⚠️ Message is already finished.", show_alert=True)
             return
         await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
         await self._refresh_moderation_status(original_chat_id, message_id, True)
-        try:
-            prefix = "Отклонено" if self._language() == "ru" else "Rejected"
-            await callback.message.edit_text(f"🚫 {prefix}: {_reject_reason_label(reason, self._language()) or reason}")
-        except TelegramAPIError:
-            LOGGER.debug("Unable to edit reject reason message", exc_info=True)
+        await self._delete_message_safely(callback.message.chat.id, callback.message.message_id)
         await callback.answer(self._t("message_rejected"))
 
     async def _handle_contact_request(self, callback: CallbackQuery) -> None:
         parsed = _parse_moderation_action_callback(callback.data, "c")
         if not parsed or not callback.message or callback.message.chat.id != self.moderator_chat_id:
+            await callback.answer()
+            return
+        if self._is_shadow_muted_moderator(callback.from_user):
             await callback.answer()
             return
         original_chat_id, message_id = parsed
@@ -2461,6 +2578,9 @@ class SlaveRuntime:
     async def _handle_ban_request(self, callback: CallbackQuery) -> None:
         parsed = _parse_moderation_action_callback(callback.data, "b")
         if not parsed or not callback.message or callback.message.chat.id != self.moderator_chat_id:
+            await callback.answer()
+            return
+        if self._is_shadow_muted_moderator(callback.from_user):
             await callback.answer()
             return
         original_chat_id, message_id = parsed
@@ -2499,14 +2619,24 @@ class SlaveRuntime:
         contact_target = self.pending_contact.get(moderator_id)
         ban_target = self.pending_ban.get(moderator_id)
         reject_target = self.pending_reject_note.get(moderator_id)
+        if self._is_shadow_muted_moderator(message.from_user):
+            if contact_target or ban_target or reject_target:
+                self.pending_contact.pop(moderator_id, None)
+                self.pending_ban.pop(moderator_id, None)
+                self.pending_reject_note.pop(moderator_id, None)
+                return True
+            return False
         if not contact_target and not ban_target and not reject_target:
             return False
 
         text = (message.text or message.caption or "").strip()
         if text.startswith("/cancel"):
+            prompt_message_id = reject_target[2] if reject_target else None
             self.pending_contact.pop(moderator_id, None)
             self.pending_ban.pop(moderator_id, None)
             self.pending_reject_note.pop(moderator_id, None)
+            if prompt_message_id:
+                await self._delete_message_safely(message.chat.id, prompt_message_id)
             await message.answer(self._t("moderator_action_cancelled"), reply_to_message_id=message.message_id)
             return True
 
@@ -2526,7 +2656,7 @@ class SlaveRuntime:
                 )
                 return True
 
-            original_chat_id, original_message_id = reject_target
+            original_chat_id, original_message_id, prompt_message_id = reject_target
             await self._remember_user_profile(message.from_user)
             row = await self.pool.fetchrow(
                 """
@@ -2548,12 +2678,16 @@ class SlaveRuntime:
             )
             self.pending_reject_note.pop(moderator_id, None)
             if not row:
+                if prompt_message_id:
+                    await self._delete_message_safely(message.chat.id, prompt_message_id)
                 await message.answer("⚠️ Message is already finished.", reply_to_message_id=message.message_id)
                 return True
 
             await self._notify_rejection_author(original_chat_id, original_message_id, "author_rejected")
             await self._refresh_moderation_status(original_chat_id, original_message_id, True)
-            await message.answer(self._t("reject_note_done"), reply_to_message_id=message.message_id)
+            if prompt_message_id:
+                await self._delete_message_safely(message.chat.id, prompt_message_id)
+            await self._delete_message_safely(message.chat.id, message.message_id)
             return True
 
         if contact_target:
@@ -2896,6 +3030,8 @@ class SlaveRuntime:
                     messages.duplicate_of_original_chat_id,
                     messages.duplicate_of_message_id,
                     messages.duplicate_score,
+                    duplicate_messages.published_message_id AS duplicate_published_message_id,
+                    duplicate_messages.moderation_message_id AS duplicate_moderation_message_id,
                     messages.reject_reason,
                     messages.reject_note,
                     messages.rejected_by,
@@ -2906,6 +3042,10 @@ class SlaveRuntime:
                 LEFT JOIN users rejected_users
                     ON rejected_users.bot_id = messages.bot_id
                     AND rejected_users.user_id = messages.rejected_by
+                LEFT JOIN incoming_messages duplicate_messages
+                    ON duplicate_messages.bot_id = messages.bot_id
+                    AND duplicate_messages.original_chat_id = messages.duplicate_of_original_chat_id
+                    AND duplicate_messages.id = messages.duplicate_of_message_id
                 WHERE messages.bot_id = $1 AND messages.original_chat_id = $2 AND messages.id = $3
                 """,
                 self.bot_id,
@@ -2953,16 +3093,7 @@ class SlaveRuntime:
             )
 
         if row and row["duplicate_score"]:
-            lines.extend(
-                [
-                    "",
-                    "🔁 "
-                    + _html(
-                        f"Possible duplicate: {row['duplicate_score']}% similar to "
-                        f"{row['duplicate_of_original_chat_id']}/{row['duplicate_of_message_id']}"
-                    ),
-                ]
-            )
+            lines.extend(["", _duplicate_warning_html(row, self.target_channel, self.moderator_chat_id)])
 
         if finished and row:
             if row["is_published"]:
@@ -2992,9 +3123,14 @@ class SlaveRuntime:
                 lines.extend(["", _html(self._t("status_closed"))])
             return "\n".join(lines), None
 
+        no_threshold_pending = bool(row and no >= self.settings["votes"])
+        if no_threshold_pending:
+            lines.extend(["", _html(self._t("reject_reason_required_status"))])
+
         lines.extend(["", f"<b>{_html(self._t('moderation_question'))}</b>"])
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
+        keyboard_rows: list[list[InlineKeyboardButton]] = []
+        if not no_threshold_pending:
+            keyboard_rows.append(
                 [
                     InlineKeyboardButton(
                         text=self._t("button_yes", count=yes),
@@ -3004,12 +3140,15 @@ class SlaveRuntime:
                         text=self._t("button_no", count=no),
                         callback_data=f"v|{original_chat_id}|{message_id}|n",
                     ),
-                ],
+                ]
+            )
+        keyboard_rows.extend(
+            [
                 [
                     InlineKeyboardButton(
                         text=self._t("button_reject"),
                         callback_data=f"r|{original_chat_id}|{message_id}",
-                    )
+                    ),
                 ],
                 [
                     InlineKeyboardButton(
@@ -3023,6 +3162,7 @@ class SlaveRuntime:
                 ],
             ]
         )
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
         return "\n".join(lines), keyboard
 
     async def _refresh_moderation_status(self, original_chat_id: int, message_id: int, finished: bool) -> None:
@@ -3139,6 +3279,14 @@ class SlaveRuntime:
             await self.bot.send_message(chat_id, text, reply_to_message_id=message_id)
         except TelegramAPIError:
             LOGGER.debug("Unable to notify author", exc_info=True)
+
+    async def _delete_message_safely(self, chat_id: int, message_id: int | None) -> None:
+        if not message_id:
+            return
+        try:
+            await self.bot.delete_message(chat_id, message_id)
+        except TelegramAPIError:
+            LOGGER.debug("Unable to delete helper message", exc_info=True)
 
     async def _notify_owner(self, text: str) -> None:
         try:
@@ -3311,6 +3459,118 @@ class SlaveRuntime:
             user.last_name,
             user.username,
         )
+
+    async def _handle_pending_shadow_mute_add(self, message: Message) -> bool:
+        if not message.from_user or message.from_user.id not in self.pending_shadow_mute_add:
+            return False
+        if not self._can_manage(message):
+            self.pending_shadow_mute_add.discard(message.from_user.id)
+            return False
+
+        value = (message.text or message.caption or "").strip()
+        if value.startswith("/cancel"):
+            self.pending_shadow_mute_add.discard(message.from_user.id)
+            await message.answer("↩️ Добавление запрета отменено.")
+            return True
+
+        ok, response = await self._add_shadow_muted_moderator(value)
+        self.pending_shadow_mute_add.discard(message.from_user.id)
+        await message.answer(response)
+        return True
+
+    async def _add_shadow_muted_moderator(self, value: str) -> tuple[bool, str]:
+        moderator = self._parse_shadow_mute_value(value)
+        if not moderator:
+            return False, "⚠️ Пришлите username вида @username или числовой Telegram ID."
+
+        muted = self._shadow_muted_moderators()
+        key = self._shadow_mute_key(moderator)
+        if any(self._shadow_mute_key(item) == key for item in muted):
+            return False, "ℹ️ Этот модератор уже в списке запрета голосования."
+
+        muted.append(moderator)
+        await self._update_setting("shadow_muted_moderators", muted)
+        return True, f"✅ Добавлен теневой запрет: {self._shadow_mute_label(moderator)}"
+
+    async def _remove_shadow_muted_moderator(self, value: str) -> tuple[bool, str]:
+        moderator = self._parse_shadow_mute_value(value)
+        if not moderator:
+            return False, "⚠️ Не понял, кого удалить из списка."
+
+        key = self._shadow_mute_key(moderator)
+        muted = [item for item in self._shadow_muted_moderators() if self._shadow_mute_key(item) != key]
+        if len(muted) == len(self._shadow_muted_moderators()):
+            return False, "ℹ️ Такого модератора нет в списке."
+
+        await self._update_setting("shadow_muted_moderators", muted)
+        return True, f"✅ Удален из запрета: {self._shadow_mute_label(moderator)}"
+
+    def _shadow_muted_moderators(self) -> list[dict[str, Any]]:
+        muted = self.settings.get("shadow_muted_moderators") or []
+        if not isinstance(muted, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for item in muted:
+            if isinstance(item, dict):
+                kind = str(item.get("kind") or "").lower()
+                value = str(item.get("value") or "").strip()
+                if kind in {"id", "username"} and value:
+                    normalized.append({"kind": kind, "value": value.lower() if kind == "username" else value})
+            elif isinstance(item, int):
+                normalized.append({"kind": "id", "value": str(item)})
+            elif isinstance(item, str):
+                parsed = self._parse_shadow_mute_value(item)
+                if parsed:
+                    normalized.append(parsed)
+        return normalized
+
+    def _parse_shadow_mute_value(self, value: Any) -> dict[str, str] | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if "|" in text:
+            kind, raw = text.split("|", 1)
+            kind = kind.strip().lower()
+            raw = raw.strip()
+            if kind == "id" and re.fullmatch(r"\d{5,20}", raw):
+                return {"kind": "id", "value": raw}
+            if kind == "username":
+                text = raw
+        if text.startswith("@"):
+            username = text[1:].strip().lower()
+            if re.fullmatch(r"[a-z0-9_]{5,32}", username):
+                return {"kind": "username", "value": username}
+            return None
+        if re.fullmatch(r"\d{5,20}", text):
+            return {"kind": "id", "value": text}
+        username = text.lower()
+        if re.fullmatch(r"[a-z0-9_]{5,32}", username):
+            return {"kind": "username", "value": username}
+        return None
+
+    def _is_shadow_muted_moderator(self, user: User | None) -> bool:
+        if not user:
+            return False
+        user_id = str(user.id)
+        username = (user.username or "").strip().lower()
+        for moderator in self._shadow_muted_moderators():
+            kind = moderator.get("kind")
+            value = str(moderator.get("value") or "").strip().lower()
+            if kind == "id" and value == user_id:
+                return True
+            if kind == "username" and username and value == username:
+                return True
+        return False
+
+    def _shadow_mute_label(self, moderator: dict[str, Any]) -> str:
+        kind = moderator.get("kind")
+        value = str(moderator.get("value") or "").strip()
+        return f"@{value}" if kind == "username" else f"id {value}"
+
+    def _shadow_mute_key(self, moderator: dict[str, Any]) -> str:
+        kind = str(moderator.get("kind") or "").lower()
+        value = str(moderator.get("value") or "").strip().lower()
+        return f"{kind}|{value}"
 
     async def _update_setting(self, key: str, value: Any) -> None:
         self.settings[key] = value
@@ -3494,6 +3754,37 @@ def _auto_filter_warning_text(reason: Any, language: str = "en") -> str:
     return f"{label}. Please check manually." if label else "Filter matched. Please check manually."
 
 
+def _duplicate_warning_html(row: Any, target_channel: str, moderator_chat_id: int) -> str:
+    score = int(row["duplicate_score"] or 0)
+    message_id = row["duplicate_published_message_id"]
+    published_link = _telegram_message_url(target_channel, message_id) if message_id else None
+    if published_link:
+        return (
+            f"🔁 Possible duplicate: {_html(score)}% similar to a previous submission. "
+            f'<a href="{_html(published_link)}">Open published post</a>.'
+        )
+
+    moderation_message_id = row["duplicate_moderation_message_id"]
+    moderation_link = _telegram_message_url(str(moderator_chat_id), moderation_message_id) if moderation_message_id else None
+    if moderation_link:
+        return (
+            f"🔁 Possible duplicate: {_html(score)}% similar to a previous submission from this bot. "
+            f'<a href="{_html(moderation_link)}">Open previous moderation card</a>.'
+        )
+    return f"🔁 Possible duplicate: {_html(score)}% similar to a previous submission from this bot."
+
+
+def _telegram_message_url(chat_id_or_username: str, message_id: Any) -> str | None:
+    target = str(chat_id_or_username or "").strip()
+    if not target or not message_id:
+        return None
+    if target.startswith("@") and len(target) > 1:
+        return f"https://t.me/{target[1:]}/{int(message_id)}"
+    if target.startswith("-100") and target[4:].isdigit():
+        return f"https://t.me/c/{target[4:]}/{int(message_id)}"
+    return None
+
+
 def _public_ai_rejection_reason(analysis: Any, language: str) -> str | None:
     text = str(analysis or "").strip()
     if not text:
@@ -3564,20 +3855,11 @@ def _rejection_reason_text(reason: Any, reason_label: str | None, note: Any) -> 
 
 def _reject_reason_keyboard(original_chat_id: int, message_id: int, language: str = "en") -> InlineKeyboardMarkup:
     if language == "ru":
-        silent_text = "🔕 Отклонить без причины"
         custom_text = "✍️ Своя причина"
     else:
-        silent_text = "🔕 Reject silently"
         custom_text = "✍️ Reject + custom note"
 
-    rows = [
-        [
-            InlineKeyboardButton(
-                text=silent_text,
-                callback_data=f"rr|{original_chat_id}|{message_id}|silent",
-            )
-        ]
-    ]
+    rows: list[list[InlineKeyboardButton]] = []
     buttons = [
         InlineKeyboardButton(
             text=f"🚫 {_reject_reason_label(key, language) or label}",
@@ -3634,26 +3916,62 @@ def _contains_strong_profanity(value: str) -> bool:
     return bool(value and (EN_PROFANITY_RE.search(value) or RU_PROFANITY_RE.search(value)))
 
 
-def _looks_like_test_submission(normalized_text: str) -> bool:
+def _looks_like_test_submission(raw_text: str, normalized_text: str) -> bool:
+    raw = str(raw_text or "").strip().lower()
     text = normalized_text.strip()
-    if not text:
+    if not raw and not text:
         return False
+    compact_raw = re.sub(r"\s+", "", raw)
+    compact_text = re.sub(r"\s+", "", text)
+    if compact_raw and len(compact_raw) <= 8 and not re.search(r"\w", compact_raw, flags=re.UNICODE):
+        return True
     test_values = {
         "test",
+        "test 1",
         "test message",
         "testing",
         "тест",
+        "тест 1",
         "тестовое сообщение",
         "проверка",
         "проверка связи",
+        "проба",
+        "asdf",
+        "asdfg",
+        "asdfgh",
+        "qwerty",
+        "qwertyuiop",
+        "йцукен",
+        "йцукенг",
+        "abc",
+        "abcd",
+        "абв",
+        "абвг",
+        "hi",
+        "hello",
+        "yo",
+        "привет",
+        "ку",
     }
-    return text in test_values
+    if text in test_values or compact_text in test_values:
+        return True
+    if re.fullmatch(
+        r"(test|testing|testmessage|тест|тестовое|тестовоесообщение|проверка|проверкасвязи|проба)\d*",
+        compact_text,
+    ):
+        return True
+    if compact_text.isdigit() and len(compact_text) <= 8:
+        return True
+    return 3 <= len(compact_text) <= 16 and len(set(compact_text)) == 1
 
 
 def _text_similarity_score(left: str, right: str) -> int:
     if not left or not right:
         return 0
     if left == right:
+        return DUPLICATE_EXACT_SCORE
+    shorter_text, longer_text = sorted((left, right), key=len)
+    if len(shorter_text) >= DUPLICATE_MIN_CHARS and f" {shorter_text} " in f" {longer_text} ":
         return DUPLICATE_EXACT_SCORE
 
     left_words = set(left.split())
@@ -3663,7 +3981,13 @@ def _text_similarity_score(left: str, right: str) -> int:
     union = left_words | right_words
     if not union:
         return 0
-    return round(100 * len(left_words & right_words) / len(union))
+    common_words = left_words & right_words
+    jaccard_score = round(100 * len(common_words) / len(union))
+    shorter_words = left_words if len(left_words) <= len(right_words) else right_words
+    containment_score = 0
+    if len(shorter_words) >= DUPLICATE_CONTAINMENT_MIN_WORDS:
+        containment_score = round(100 * len(common_words) / len(shorter_words))
+    return max(jaccard_score, containment_score)
 
 
 def _freq_limit_label(limit: tuple[int, int]) -> str:

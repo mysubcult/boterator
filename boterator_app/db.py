@@ -33,18 +33,20 @@ DEFAULT_SLAVE_SETTINGS: dict[str, Any] = {
     },
     "selfvote": True,
     "msg_freq_limit": None,
+    "owner_rate_limit_bypass": True,
     "duplicate_detection": {
         "enabled": True,
         "days": 180,
     },
     "auto_reject": {
-        "enabled": False,
+        "enabled": True,
         "links": "reject",
         "profanity": "flag",
         "test": "reject",
     },
     "allow_vote_switch": False,
     "tag_polls": False,
+    "shadow_muted_moderators": [],
     "ai": {
         "enabled": False,
         "provider": "openai",
