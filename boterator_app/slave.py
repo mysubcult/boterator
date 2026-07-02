@@ -3483,6 +3483,13 @@ class SlaveRuntime:
         if not moderator:
             return False, "⚠️ Пришлите username вида @username или числовой Telegram ID."
 
+        resolved_by_username = False
+        if moderator["kind"] == "username":
+            resolved = await self._resolve_shadow_mute_username(moderator["value"])
+            if resolved:
+                moderator = resolved
+                resolved_by_username = True
+
         muted = self._shadow_muted_moderators()
         key = self._shadow_mute_key(moderator)
         if any(self._shadow_mute_key(item) == key for item in muted):
@@ -3490,7 +3497,10 @@ class SlaveRuntime:
 
         muted.append(moderator)
         await self._update_setting("shadow_muted_moderators", muted)
-        return True, f"✅ Добавлен теневой запрет: {self._shadow_mute_label(moderator)}"
+        suffix = "\nID найден в базе, поэтому смена username не снимет запрет." if resolved_by_username else ""
+        if moderator["kind"] == "username":
+            suffix = "\n⚠️ ID пока не найден в базе, поэтому запрет привязан к username. Надежнее добавить Telegram ID."
+        return True, f"✅ Добавлен теневой запрет: {self._shadow_mute_label(moderator)}{suffix}"
 
     async def _remove_shadow_muted_moderator(self, value: str) -> tuple[bool, str]:
         moderator = self._parse_shadow_mute_value(value)
@@ -3515,7 +3525,11 @@ class SlaveRuntime:
                 kind = str(item.get("kind") or "").lower()
                 value = str(item.get("value") or "").strip()
                 if kind in {"id", "username"} and value:
-                    normalized.append({"kind": kind, "value": value.lower() if kind == "username" else value})
+                    moderator = {"kind": kind, "value": value.lower() if kind == "username" else value}
+                    username = str(item.get("username") or "").strip().lower()
+                    if username and re.fullmatch(r"[a-z0-9_]{5,32}", username):
+                        moderator["username"] = username
+                    normalized.append(moderator)
             elif isinstance(item, int):
                 normalized.append({"kind": "id", "value": str(item)})
             elif isinstance(item, str):
@@ -3560,17 +3574,41 @@ class SlaveRuntime:
                 return True
             if kind == "username" and username and value == username:
                 return True
+            if kind == "id" and username and str(moderator.get("username") or "").strip().lower() == username:
+                return True
         return False
 
     def _shadow_mute_label(self, moderator: dict[str, Any]) -> str:
         kind = moderator.get("kind")
         value = str(moderator.get("value") or "").strip()
-        return f"@{value}" if kind == "username" else f"id {value}"
+        if kind == "username":
+            return f"@{value}"
+        username = str(moderator.get("username") or "").strip()
+        return f"id {value} (@{username})" if username else f"id {value}"
 
     def _shadow_mute_key(self, moderator: dict[str, Any]) -> str:
         kind = str(moderator.get("kind") or "").lower()
         value = str(moderator.get("value") or "").strip().lower()
         return f"{kind}|{value}"
+
+    async def _resolve_shadow_mute_username(self, username: str) -> dict[str, str] | None:
+        username = username.strip().lower().lstrip("@")
+        if not username:
+            return None
+        row = await self.pool.fetchrow(
+            """
+            SELECT user_id, username
+            FROM users
+            WHERE bot_id = $1 AND lower(username) = $2
+            ORDER BY updated_at DESC
+            LIMIT 1
+            """,
+            self.bot_id,
+            username,
+        )
+        if not row:
+            return None
+        return {"kind": "id", "value": str(row["user_id"]), "username": str(row["username"] or username).lower()}
 
     async def _update_setting(self, key: str, value: Any) -> None:
         self.settings[key] = value
