@@ -1122,6 +1122,53 @@ class SlaveRuntime:
                 "Если backup-скрипт запускается вручную, команда описана в README."
             )
 
+        if section == "flow":
+            return (
+                "🛡️ Модерация\n\n"
+                "Основной поток проверки: голоса, задержка публикации, разрешенные типы контента "
+                "и права модераторов.\n\n"
+                f"🗳️ Голосов для решения: {self.settings['votes']}\n"
+                f"⌛ Таймаут голосования: {self.settings['vote_timeout']} ч.\n"
+                f"🚀 Задержка публикации: {self.settings['delay']} мин.\n"
+                f"🔇 Теневых запретов: {len(self._shadow_muted_moderators())}"
+            )
+
+        if section == "automation":
+            freq_limit = self._freq_limit()
+            return (
+                "🤖 Автоматизация\n\n"
+                "AI, автофильтр, антиспам и проверка дублей помогают принимать решение, "
+                "когда модераторы не успели или заявка выглядит рискованной.\n\n"
+                f"🤖 AI-анализ: {_enabled_label(self._ai_enabled())}\n"
+                f"🚦 AI после таймаута: {_enabled_label(self._ai_auto_publish_enabled())}, "
+                f"порог {self._ai_auto_publish_min_score()}%\n"
+                f"🧱 Автофильтр: {_enabled_label(self._auto_reject_enabled())}\n"
+                f"🚦 Лимит отправки: {_freq_limit_label(freq_limit) if freq_limit else 'выключен'}\n"
+                f"🔁 Проверка дублей: {_enabled_label(self._duplicate_detection_enabled())}"
+            )
+
+        if section == "appearance":
+            enabled_content = [
+                label
+                for key, label in CONTENT_LABELS.items()
+                if self.settings["content_status"].get(key, False)
+            ]
+            return (
+                "💬 Тексты и внешний вид\n\n"
+                "Публичный язык, приветствие /start, лимиты текста и разрешенные форматы заявок.\n\n"
+                f"🌐 Язык публичных сообщений: {LANGUAGE_LABELS[self._language()]}\n"
+                f"👋 Приветствие: {'стандартное' if self._start_text_is_default() else 'свое'}\n"
+                f"✍️ Текст: {self.settings['text_min']}-{self.settings['text_max']} символов\n"
+                f"🧩 Контент: {', '.join(enabled_content) if enabled_content else 'ничего'}"
+            )
+
+        if section == "system":
+            return (
+                "📊 Система\n\n"
+                "Статистика, health-состояние и backup. Эти разделы ничего не меняют в модерации, "
+                "но помогают быстро проверить, что бот жив и работает ожидаемо."
+            )
+
         enabled_content = [
             label
             for key, label in CONTENT_LABELS.items()
@@ -1163,7 +1210,7 @@ class SlaveRuntime:
                             "vote",
                         )
                     ],
-                    _back_row(),
+                    _back_row("flow"),
                 ]
             )
 
@@ -1173,7 +1220,7 @@ class SlaveRuntime:
                 for key, label in CONTENT_LABELS.items()
             ]
             rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
-            rows.append(_back_row())
+            rows.append(_back_row("flow"))
             return InlineKeyboardMarkup(inline_keyboard=rows)
 
         if section == "ai":
@@ -1202,7 +1249,7 @@ class SlaveRuntime:
                     [InlineKeyboardButton(text="🧾 System prompt", callback_data="s|nav|ai_prompt")],
                     [InlineKeyboardButton(text="🔑 Добавить/заменить ключ", callback_data=f"s|ai_key|{provider}|ai")],
                     [InlineKeyboardButton(text="🧹 Удалить ключ", callback_data="s|clear_ai|ai")],
-                    _back_row(),
+                    [InlineKeyboardButton(text="⬅️ Назад к AI", callback_data="s|nav|ai")],
                 ]
             )
 
@@ -1212,7 +1259,7 @@ class SlaveRuntime:
                     [InlineKeyboardButton(text="✏️ Редактировать полный prompt", callback_data="s|ai_prompt_edit")],
                     [InlineKeyboardButton(text="🕓 История / rollback", callback_data="s|nav|ai_prompt_history")],
                     [InlineKeyboardButton(text="🔄 Сбросить к дефолтному", callback_data="s|ai_prompt_reset")],
-                    [InlineKeyboardButton(text="⬅️ Назад к AI", callback_data="s|nav|ai")],
+                    _back_row("automation"),
                 ]
             )
 
@@ -1274,7 +1321,7 @@ class SlaveRuntime:
                     ],
                     [_toggle_button("🙋 Самоголосование", "selfvote", self.settings.get("selfvote", True), "publish")],
                     [_toggle_button("🏷️ Теги статуса", "tag_polls", self.settings.get("tag_polls", False), "publish")],
-                    _back_row(),
+                    _back_row("flow"),
                 ]
             )
 
@@ -1292,7 +1339,7 @@ class SlaveRuntime:
                         )
                     ]
                 )
-            rows.append(_back_row())
+            rows.append(_back_row("flow"))
             return InlineKeyboardMarkup(inline_keyboard=rows)
 
         if section == "language":
@@ -1303,7 +1350,7 @@ class SlaveRuntime:
                         _language_button("🇷🇺 Русский", "ru", language),
                         _language_button("🇬🇧 English", "en", language),
                     ],
-                    _back_row(),
+                    _back_row("appearance"),
                 ]
             )
 
@@ -1312,7 +1359,7 @@ class SlaveRuntime:
                 inline_keyboard=[
                     _adjust_row("⬇️ Мин.", "text_min", -10, 10, "text"),
                     _adjust_row("⬆️ Макс.", "text_max", -100, 100, "text"),
-                    _back_row(),
+                    _back_row("appearance"),
                 ]
             )
 
@@ -1332,7 +1379,7 @@ class SlaveRuntime:
                     ],
                     [InlineKeyboardButton(text="✅ 2 сообщения за 24 ч.", callback_data="s|freq_preset")],
                     [InlineKeyboardButton(text="🚫 Выключить лимит", callback_data="s|freq_disable")],
-                    _back_row(),
+                    _back_row("automation"),
                 ]
             )
 
@@ -1350,7 +1397,7 @@ class SlaveRuntime:
                     _duplicate_days_adjust_row("🗓️ 7 дн.", -7, 7),
                     _duplicate_days_adjust_row("🗓️ 30 дн.", -30, 30),
                     _duplicate_days_adjust_row("🗓️ 180 дн.", -180, 180),
-                    _back_row(),
+                    _back_row("automation"),
                 ]
             )
 
@@ -1362,7 +1409,7 @@ class SlaveRuntime:
                     [_auto_filter_mode_button("🔗 Ссылки", "links", settings["links"])],
                     [_auto_filter_mode_button("🤬 Жесткий мат", "profanity", settings["profanity"])],
                     [_auto_filter_mode_button("🧪 Тест/placeholder", "test", settings["test"])],
-                    _back_row(),
+                    _back_row("automation"),
                 ]
             )
 
@@ -1371,43 +1418,74 @@ class SlaveRuntime:
                 inline_keyboard=[
                     [InlineKeyboardButton(text="✏️ Изменить приветствие", callback_data="s|start_edit")],
                     [InlineKeyboardButton(text="🔄 Сбросить к стандартному", callback_data="s|start_reset")],
-                    _back_row(),
+                    _back_row("appearance"),
                 ]
             )
 
         if section in {"stats", "health"}:
-            return InlineKeyboardMarkup(inline_keyboard=[_back_row()])
+            return InlineKeyboardMarkup(inline_keyboard=[_back_row("system")])
+
+        if section == "flow":
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🗳️ Голосование", callback_data="s|nav|vote"),
+                        InlineKeyboardButton(text="🚀 Публикация", callback_data="s|nav|publish"),
+                    ],
+                    [
+                        InlineKeyboardButton(text="🔇 Модераторы", callback_data="s|nav|moderators"),
+                        InlineKeyboardButton(text="🧩 Контент", callback_data="s|nav|content"),
+                    ],
+                    _back_row(),
+                ]
+            )
+
+        if section == "automation":
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🤖 AI-анализ", callback_data="s|nav|ai")],
+                    [
+                        InlineKeyboardButton(text="🧱 Автофильтр", callback_data="s|nav|auto_reject"),
+                        InlineKeyboardButton(text="🚦 Антиспам", callback_data="s|nav|freq"),
+                    ],
+                    [InlineKeyboardButton(text="🔁 Дубли", callback_data="s|nav|duplicates")],
+                    _back_row(),
+                ]
+            )
+
+        if section == "appearance":
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="🌐 Язык", callback_data="s|nav|language"),
+                        InlineKeyboardButton(text="👋 Приветствие", callback_data="s|nav|start"),
+                    ],
+                    [InlineKeyboardButton(text="✍️ Лимиты текста", callback_data="s|nav|text")],
+                    _back_row(),
+                ]
+            )
+
+        if section == "system":
+            return InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="📊 Статистика", callback_data="s|nav|stats"),
+                        InlineKeyboardButton(text="🩺 Health/backup", callback_data="s|nav|health"),
+                    ],
+                    _back_row(),
+                ]
+            )
 
         return InlineKeyboardMarkup(
             inline_keyboard=[
+                [InlineKeyboardButton(text="🛡️ Модерация", callback_data="s|nav|flow")],
+                [InlineKeyboardButton(text="🤖 Автоматизация", callback_data="s|nav|automation")],
+                [InlineKeyboardButton(text="💬 Тексты и внешний вид", callback_data="s|nav|appearance")],
+                [InlineKeyboardButton(text="📊 Система", callback_data="s|nav|system")],
                 [
-                    InlineKeyboardButton(text="🗳️ Голосование", callback_data="s|nav|vote"),
-                    InlineKeyboardButton(text="🧩 Контент", callback_data="s|nav|content"),
-                ],
-                [
-                    InlineKeyboardButton(text="🤖 AI-анализ", callback_data="s|nav|ai"),
-                    InlineKeyboardButton(text="🚀 Публикация", callback_data="s|nav|publish"),
-                ],
-                [
-                    InlineKeyboardButton(text="🔇 Модераторы", callback_data="s|nav|moderators"),
-                    InlineKeyboardButton(text="🌐 Язык", callback_data="s|nav|language"),
-                ],
-                [
-                    InlineKeyboardButton(text="👋 Приветствие", callback_data="s|nav|start"),
-                    InlineKeyboardButton(text="✍️ Лимиты текста", callback_data="s|nav|text"),
-                ],
-                [
-                    InlineKeyboardButton(text="🚦 Антиспам", callback_data="s|nav|freq"),
-                    InlineKeyboardButton(text="🔁 Дубли", callback_data="s|nav|duplicates"),
-                ],
-                [
-                    InlineKeyboardButton(text="🧱 Автофильтр", callback_data="s|nav|auto_reject"),
                     InlineKeyboardButton(text="📊 Статистика", callback_data="s|nav|stats"),
+                    InlineKeyboardButton(text="✅ Закрыть", callback_data="s|close"),
                 ],
-                [
-                    InlineKeyboardButton(text="🩺 Backup/health", callback_data="s|nav|health"),
-                ],
-                [InlineKeyboardButton(text="✅ Закрыть", callback_data="s|close")],
             ]
         )
 
@@ -4089,8 +4167,8 @@ def _duplicate_days_adjust_row(label: str, minus_delta: int, plus_delta: int) ->
     ]
 
 
-def _back_row() -> list[InlineKeyboardButton]:
-    return [InlineKeyboardButton(text="⬅️ Назад", callback_data="s|nav|main")]
+def _back_row(section: str = "main") -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"s|nav|{section}")]
 
 
 def _content_key(message: Message) -> str | None:
