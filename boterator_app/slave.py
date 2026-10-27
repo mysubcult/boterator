@@ -17,7 +17,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramMigrateToChat
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 
-from .ai import AiAnalyzer, build_system_prompt
+from .ai import RUBRIC_MAX, RUBRIC_MIN_CRITERION_TO_PUBLISH, AiAnalyzer, build_system_prompt, needed_total, uses_legacy_format
 from .db import merge_settings
 from .i18n import (
     DEFAULT_START_TEXTS,
@@ -66,10 +66,11 @@ FREQ_LIMIT_DEFAULT_COUNT = 2
 FREQ_LIMIT_DEFAULT_HOURS = 24
 FREQ_LIMIT_MAX_COUNT = 1000
 FREQ_LIMIT_MAX_HOURS = 8760
-AI_AUTO_PUBLISH_DEFAULT_SCORE = 85
+AI_AUTO_PUBLISH_DEFAULT_SCORE = 75
 AI_AUTO_PUBLISH_MIN_SCORE = 50
 AI_AUTO_PUBLISH_MAX_SCORE = 100
-AI_ANALYSIS_TIMEOUT_SECONDS = 90
+# Borderline results are asked again (see ai.BORDERLINE_EXTRA_RUNS), so allow for two rounds of answers.
+AI_ANALYSIS_TIMEOUT_SECONDS = 240
 AI_PROMPT_MAX_LENGTH = 4096
 PENDING_SUBMISSIONS_LIMIT = 500
 AI_FAILURE_TEXTS = frozenset(texts["ai_analysis_failed"] for texts in PUBLIC_TEXTS.values())
@@ -545,8 +546,8 @@ class SlaveRuntime:
                 self.pending_ai_prompt.add(message.from_user.id)
                 await message.answer(
                     "🧾 Пришлите следующим сообщением полный AI system prompt.\n\n"
-                    "Он полностью заменит текущий prompt. Сохраните в нем требуемый формат ответа, "
-                    "иначе автопубликация может хуже понимать verdict и процент."
+                    "Он полностью заменит текущий prompt. Опишите канал и что в нем публиковать; "
+                    "критерии оценки и формат ответа бот добавит сам."
                 )
                 return
             ok, response = await self._set_ai_prompt(parts[1].strip())
@@ -967,10 +968,14 @@ class SlaveRuntime:
                 f"🧬 Модель: {model}\n"
                 f"🧾 System prompt: {prompt_state}\n"
                 f"🚀 Автопубликация после таймаута: {auto_state}\n"
-                f"🎯 Порог AI-одобрения: {auto_score}%\n\n"
+                f"🎯 Порог AI-одобрения: {auto_score}% {self._ai_threshold_hint()}\n\n"
                 "🔒 Ключ можно добавить только владельцу в личке с ботом. "
-                "Автопубликация сработает только если AI дал verdict publish, "
-                "процент не ниже порога, а модераторы не нажимали против. "
+                "AI ставит три оценки от 0 до 3: тема канала, качество, ясность — и отмечает флаги "
+                "(спам, опасное, не по теме) и риск неаутентичности. Решение принимает бот: "
+                "публикация, если флагов нет, риск не высокий, каждая оценка не ниже "
+                f"{RUBRIC_MIN_CRITERION_TO_PUBLISH} и сумма не ниже порога. Результаты у самого порога "
+                "AI перепроверяет еще дважды. Автопубликация срабатывает после таймаута, "
+                "если модераторы не нажимали против. "
                 "System prompt влияет на AI-вердикт и автопубликацию. "
                 "API-ключ не показывается в меню. Для ввода можно нажать кнопку ниже "
                 f"или отправить команду /setaikey {provider} <ключ>."
@@ -992,7 +997,7 @@ class SlaveRuntime:
                 "📄 Текущий полный prompt:\n"
                 f"{prompt}\n\n"
                 "✏️ При редактировании новый текст полностью заменит этот prompt. "
-                "Сохраняйте строку verdict/publish chance, если используете AI-автопубликацию.\n\n"
+                f"{self._ai_prompt_format_note()}\n\n"
                 f"{history}"
             )
 
@@ -1925,7 +1930,18 @@ class SlaveRuntime:
         return str(ai_settings.get("openai_model") or "gpt-5-mini")
 
     def _ai_full_prompt(self) -> str:
-        return build_system_prompt(self._language(), self.settings.get("ai", {}))
+        return build_system_prompt(self._language(), self.settings.get("ai", {}), with_format=False)
+
+    def _ai_prompt_format_note(self) -> str:
+        if uses_legacy_format(self._ai_full_prompt()):
+            return (
+                "ℹ️ Этот prompt задает старый формат ответа (verdict/publish chance): бот читает вердикт и процент "
+                "из первой строки. Уберите формат из prompt, чтобы перейти на оценку по критериям."
+            )
+        return "ℹ️ Критерии оценки (тема, качество, ясность, флаги) и формат ответа бот добавляет к prompt сам."
+
+    def _ai_threshold_hint(self) -> str:
+        return f"(сумма ≥ {needed_total(self._ai_auto_publish_min_score())}/{RUBRIC_MAX})"
 
     def _ai_prompt_state(self) -> str:
         ai_settings = self.settings.get("ai", {})
@@ -4019,6 +4035,7 @@ def _public_ai_rejection_reason(analysis: Any, language: str) -> str | None:
     if not text:
         return None
 
+    author_notes: list[str] = []
     preferred: list[str] = []
     fallback: list[str] = []
     for raw_line in text.splitlines():
@@ -4037,14 +4054,18 @@ def _public_ai_rejection_reason(analysis: Any, language: str) -> str | None:
         if not details:
             continue
 
-        if label in {"риски", "risk", "risks", "сигналы", "signal", "signals"}:
+        if label in {"for author", "автору"}:
+            author_notes.append(details)
+        elif label in {"риски", "risk", "risks", "сигналы", "signal", "signals"}:
             preferred.append(details)
-        elif label in {"вердикт", "verdict"} or "%" in details:
+        elif label in {"вердикт", "verdict", "authenticity risk", "риск неаутентичности", "flags", "флаги"} or "%" in details:
+            continue
+        elif "/3" in details:
             continue
         else:
             fallback.append(details)
 
-    reason = _clean_public_reason_fragment("; ".join((preferred or fallback)[:2]).strip())
+    reason = _clean_public_reason_fragment("; ".join((author_notes or preferred or fallback)[:2]).strip())
     if not reason:
         if language == "en":
             return "the submission does not fit the channel guidelines."

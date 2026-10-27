@@ -55,7 +55,7 @@ DEFAULT_SLAVE_SETTINGS: dict[str, Any] = {
         "gemini_api_key": None,
         "gemini_model": "gemini-3.5-flash",
         "auto_publish_after_timeout": False,
-        "auto_publish_min_score": 85,
+        "auto_publish_min_score": 75,
         "system_prompt": None,
         "custom_prompt": None,
     },

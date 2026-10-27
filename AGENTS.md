@@ -22,10 +22,15 @@
 - Провайдер — DeepSeek (`AI_PROVIDER=deepseek`, ключ `DEEPSEEK_API_KEY` в `.env`; баланс проверяет общий
   мониторинг сервера). Модель `deepseek-flash` видит фото; у видео/GIF — кадр-заставку.
   Режим размышлений `DEEPSEEK_REASONING_EFFORT=high`.
-- Промпты — в БД (`settings.ai.system_prompt`), копии в `agent-docs/prompt-*.txt`. Первая строка ответа обязана быть
-  `🧭 Verdict: publish|review|reject | publish chance NN%` — из неё берутся вердикт и процент.
-- Автопубликация: через `vote_timeout` (1 ч) пост без голосов «против» публикуется, если вердикт publish и процент
-  ≥ `auto_publish_min_score` (85). Иначе — отказ (`ai_reject` / `timeout`).
+- Промпты — в БД (`settings.ai.system_prompt`), копии в `agent-docs/prompt-*.txt`. В промпте — только канал и что
+  значат оценки для него; формат ответа (JSON) бот дописывает сам (`ai.RUBRIC_FORMAT`). Промпт со старой строкой
+  `Verdict: … | publish chance NN%` работает по-старому (процент от модели).
+- Оценка: модель ставит `fit`, `quality`, `clarity` от 0 до 3, флаги `spam`/`unsafe`/`off_topic` и
+  `authenticity_risk` low/medium/high. Решает код (`ai.rubric_decision`): флаг, high или оценка < 2 → reject;
+  сумма в % ≥ `auto_publish_min_score` (75 = 7 из 9) → publish; на балл ниже → review («на грани», для модераторов).
+  Результат у самого порога спрашивается ещё 2 раза, берётся медиана. Автору при отказе уходит `author_note`.
+- Автопубликация: через `vote_timeout` (1 ч) пост без голосов «против» публикуется, если вердикт publish.
+  Иначе — отказ (`ai_reject` / `timeout`).
 - Если ИИ не ответил — пост не отклоняется по таймауту, анализ повторяется раз в 30 мин до 48 ч; владельцу приходит
   health alert в личку от бота-приёмника.
 

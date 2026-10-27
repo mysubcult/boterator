@@ -171,7 +171,7 @@ If AI fails, times out, or the model/API key is invalid:
 - with AI auto-publish enabled, the vote timeout does not reject the message while the AI verdict is missing: the analysis is retried every 30 minutes, and only after 48 hours without a verdict does the usual timeout apply;
 - the failure is logged, but the bot process keeps running.
 
-The system prompt must keep the first answer line `Verdict: publish|review|reject | publish chance NN%`: the verdict and the score are read from that line only. Prompts are limited to 4096 characters (one Telegram message).
+The system prompt describes the channel and what the scores mean for it; the bot appends the answer format itself. The model returns JSON with three scores from 0 to 3 (`fit`, `quality`, `clarity`), hard flags (`spam`, `unsafe`, `off_topic`), `authenticity_risk` (low/medium/high), short signals and risks, and a polite note for the author. The bot decides: any flag, high authenticity risk, or a score below 2 rejects; otherwise the total as a percentage of 9 must reach the AI auto-publish threshold (default 75%, i.e. 7 of 9); one point short is shown as `review`. Results right at the threshold are asked two more times and the median decides. When a submission is rejected by the AI, the author receives the author note. A prompt that still contains the old `publish chance NN%` answer line keeps the old behaviour (verdict and percentage from the model). Prompts are limited to 4096 characters (one Telegram message).
 
 DeepSeek and OpenAI model changes are checked with the current API key before saving. Gemini models are checked through the Gemini model list and a small `generateContent` test.
 
