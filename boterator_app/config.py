@@ -18,6 +18,9 @@ class Settings:
     openai_model: str = "gpt-5-mini"
     gemini_api_key: str | None = None
     gemini_model: str = "gemini-3.5-flash"
+    deepseek_api_key: str | None = None
+    deepseek_model: str = "deepseek-flash"
+    deepseek_reasoning_effort: str = "high"
     data_retention_days: int = 90
     cleanup_interval_hours: int = 24
 
@@ -36,8 +39,12 @@ class Settings:
             raise RuntimeError("PUBLISH_MODE must be either 'copy' or 'forward'")
 
         ai_provider = os.getenv("AI_PROVIDER", "none").strip().lower()
-        if ai_provider not in {"none", "openai", "gemini"}:
-            raise RuntimeError("AI_PROVIDER must be one of: none, openai, gemini")
+        if ai_provider not in {"none", "openai", "gemini", "deepseek"}:
+            raise RuntimeError("AI_PROVIDER must be one of: none, openai, gemini, deepseek")
+
+        deepseek_effort = os.getenv("DEEPSEEK_REASONING_EFFORT", "high").strip().lower()
+        if deepseek_effort not in {"off", "low", "high", "max"}:
+            raise RuntimeError("DEEPSEEK_REASONING_EFFORT must be one of: off, low, high, max")
 
         return cls(
             master_token=master_token,
@@ -52,6 +59,9 @@ class Settings:
             openai_model=os.getenv("OPENAI_MODEL", "gpt-5-mini"),
             gemini_api_key=os.getenv("GEMINI_API_KEY"),
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+            deepseek_api_key=os.getenv("DEEPSEEK_API_KEY"),
+            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-flash"),
+            deepseek_reasoning_effort=deepseek_effort,
             data_retention_days=max(1, int(os.getenv("DATA_RETENTION_DAYS", "90"))),
             cleanup_interval_hours=max(1, int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))),
         )

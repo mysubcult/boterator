@@ -14,7 +14,7 @@ Boterator lets users submit posts to a bot, forwards the original Telegram messa
 - Owner-only settings menu in private chat via `/settings`.
 - Public users only need `/start` and `/stats`.
 - Russian and English public/moderation texts per registered bot.
-- Optional OpenAI or Gemini analysis for text and image submissions.
+- Optional DeepSeek, OpenAI or Gemini analysis for text and image submissions (videos and GIFs by their preview frame).
 - Optional AI fallback: after the voting timeout, AI can auto-approve only when its initial verdict is `publish`, the score is above the configured threshold, and moderators did not vote against the post.
 - Per-bot AI keys can be stored from the owner-only settings menu.
 - Local text/caption duplicate detection for recent submissions. This does not use AI tokens.
@@ -27,7 +27,7 @@ Boterator lets users submit posts to a bot, forwards the original Telegram messa
 - Docker and Docker Compose.
 - A Telegram master bot token from BotFather.
 - PostgreSQL. The compose file includes PostgreSQL.
-- Optional: OpenAI or Gemini API key for AI analysis.
+- Optional: DeepSeek, OpenAI or Gemini API key for AI analysis.
 
 ## Quick Start
 
@@ -67,7 +67,8 @@ Optional:
 - `LOG_LEVEL=INFO|WARNING|ERROR`
 - `DATA_RETENTION_DAYS=90` - how long to keep finished moderation records and related votes.
 - `CLEANUP_INTERVAL_HOURS=24` - how often cleanup runs.
-- `AI_PROVIDER=none|openai|gemini`
+- `AI_PROVIDER=none|deepseek|openai|gemini`
+- `DEEPSEEK_API_KEY`, `DEEPSEEK_MODEL` (default `deepseek-flash`, sees images), `DEEPSEEK_REASONING_EFFORT=off|low|high|max` (default `high`)
 - `OPENAI_API_KEY`, `OPENAI_MODEL`
 - `GEMINI_API_KEY`, `GEMINI_MODEL`
 - `AI_MAX_IMAGE_BYTES` - max image size downloaded for AI analysis.
@@ -120,9 +121,11 @@ Text commands still exist as shortcuts for the owner:
 /allow photo off
 /setai on
 /setai off
+/setaikey deepseek <key>
 /setaikey openai <key>
 /setaikey gemini <key>
-/setaimodel gpt-5-mini-2025-08-07
+/setaimodel deepseek-flash
+/setaimodel deepseek deepseek-v4-pro
 /setaimodel openai gpt-5-mini-2025-08-07
 /setaiprompt <full AI system prompt>
 /resetaiprompt
@@ -164,10 +167,13 @@ If AI fails, times out, or the model/API key is invalid:
 
 - the message stays in moderation;
 - moderator voting continues;
-- auto-publish by AI will not trigger for that message;
+- the owner gets a health alert (at most once an hour);
+- with AI auto-publish enabled, the vote timeout does not reject the message while the AI verdict is missing: the analysis is retried every 30 minutes, and only after 48 hours without a verdict does the usual timeout apply;
 - the failure is logged, but the bot process keeps running.
 
-OpenAI model changes are checked with the current API key before saving. Gemini models are checked through the Gemini model list and a small `generateContent` test.
+The system prompt must keep the first answer line `Verdict: publish|review|reject | publish chance NN%`: the verdict and the score are read from that line only. Prompts are limited to 4096 characters (one Telegram message).
+
+DeepSeek and OpenAI model changes are checked with the current API key before saving. Gemini models are checked through the Gemini model list and a small `generateContent` test.
 
 ## Moderator Actions
 

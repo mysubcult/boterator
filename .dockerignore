@@ -1,2 +1,5 @@
 docker-compose.yml
 .idea
+.env
+.git
+backups

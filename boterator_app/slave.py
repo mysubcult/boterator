@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import html
+import json
 import logging
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
@@ -21,6 +22,7 @@ from .db import merge_settings
 from .i18n import (
     DEFAULT_START_TEXTS,
     LANGUAGE_LABELS,
+    PUBLIC_TEXTS,
     content_label,
     default_text,
     normalize_language,
@@ -68,7 +70,13 @@ AI_AUTO_PUBLISH_DEFAULT_SCORE = 85
 AI_AUTO_PUBLISH_MIN_SCORE = 50
 AI_AUTO_PUBLISH_MAX_SCORE = 100
 AI_ANALYSIS_TIMEOUT_SECONDS = 90
-AI_PROMPT_MAX_LENGTH = 3200
+AI_PROMPT_MAX_LENGTH = 4096
+PENDING_SUBMISSIONS_LIMIT = 500
+AI_FAILURE_TEXTS = frozenset(texts["ai_analysis_failed"] for texts in PUBLIC_TEXTS.values())
+# How long a submission may wait for a missing AI verdict (provider outage) before the vote timeout applies anyway.
+AI_RETRY_MAX_HOURS = 48
+AI_RETRY_INTERVAL_SECONDS = 1800
+AI_PROMPT_PREVIEW_CHARS = 2800
 BAN_REASON_MIN_LENGTH = 5
 CONTACT_MESSAGE_MAX_LENGTH = 3900
 REJECT_NOTE_MAX_LENGTH = 1200
@@ -175,9 +183,15 @@ PUBLISH_MODE_LABELS = {
 }
 
 AI_PROVIDER_LABELS = {
+    "deepseek": "🐳 DeepSeek",
     "openai": "🤖 OpenAI",
     "gemini": "✨ Gemini",
 }
+
+DEEPSEEK_MODEL_PRESETS = [
+    "deepseek-flash",
+    "deepseek-v4-pro",
+]
 
 OPENAI_OFFER_MODELS_1M = [
     "gpt-5.5-2026-04-23",
@@ -300,6 +314,7 @@ class SlaveRuntime:
         self.pending_reject_note: dict[int, tuple[int, int, int | None]] = {}
         self.pending_shadow_mute_add: set[int] = set()
         self.health_alerts: dict[str, float] = {}
+        self.last_ai_retry = 0.0
         self.task: asyncio.Task | None = None
         self.publisher_task: asyncio.Task | None = None
         self.timeout_task: asyncio.Task | None = None
@@ -469,7 +484,7 @@ class SlaveRuntime:
                 return
             if parts[1] == "on" and not self._ai_configured():
                 await message.answer(
-                    "🔑 Сначала добавьте ключ: /setaikey openai <ключ> или /setaikey gemini <ключ>."
+                    "🔑 Сначала добавьте ключ: /setaikey deepseek|openai|gemini <ключ>."
                 )
                 return
             await self._set_ai_enabled(parts[1] == "on")
@@ -482,7 +497,7 @@ class SlaveRuntime:
             parts = (message.text or "").split(maxsplit=2)
             provider = parts[1].lower() if len(parts) >= 2 else None
             if provider not in AI_PROVIDER_LABELS:
-                await message.answer("🔑 Использование: /setaikey openai <ключ> или /setaikey gemini <ключ>")
+                await message.answer("🔑 Использование: /setaikey deepseek|openai|gemini <ключ>")
                 return
             self.pending_start_text.discard(message.from_user.id)
             self.pending_ai_model.pop(message.from_user.id, None)
@@ -504,7 +519,7 @@ class SlaveRuntime:
                 return
             parts = (message.text or "").split(maxsplit=2)
             if len(parts) < 2:
-                await message.answer("🧬 Использование: /setaimodel gpt-5-mini-2025-08-07")
+                await message.answer("🧬 Использование: /setaimodel deepseek-flash или /setaimodel deepseek deepseek-v4-pro")
                 return
             if len(parts) == 3 and parts[1].lower() in AI_PROVIDER_LABELS:
                 provider = parts[1].lower()
@@ -554,7 +569,7 @@ class SlaveRuntime:
             parts = (message.text or "").split(maxsplit=1)
             provider = parts[1].lower() if len(parts) == 2 else None
             if provider is not None and provider not in AI_PROVIDER_LABELS:
-                await message.answer("🧹 Использование: /clearaikey или /clearaikey openai|gemini")
+                await message.answer("🧹 Использование: /clearaikey или /clearaikey deepseek|openai|gemini")
                 return
             await self._clear_ai_key(provider)
             await message.answer("🧹 AI-ключ удален. AI-анализ выключен." if provider is None else f"🧹 Ключ {AI_PROVIDER_LABELS[provider]} удален.")
@@ -958,11 +973,17 @@ class SlaveRuntime:
                 "процент не ниже порога, а модераторы не нажимали против. "
                 "System prompt влияет на AI-вердикт и автопубликацию. "
                 "API-ключ не показывается в меню. Для ввода можно нажать кнопку ниже "
-                "или отправить команду /setaikey openai <ключ>."
+                f"или отправить команду /setaikey {provider} <ключ>."
             )
 
         if section == "ai_prompt":
             prompt = self._ai_full_prompt()
+            if len(prompt) > AI_PROMPT_PREVIEW_CHARS:
+                # A Telegram message holds 4096 characters: show the start, the full text goes to the model.
+                prompt = (
+                    f"{prompt[:AI_PROMPT_PREVIEW_CHARS].rstrip()}\n"
+                    f"… (показаны первые {AI_PROMPT_PREVIEW_CHARS} из {len(prompt)} символов)"
+                )
             history = await self._prompt_history_preview()
             return (
                 "🧾 AI system prompt\n\n"
@@ -986,7 +1007,7 @@ class SlaveRuntime:
                 lines.append("")
             return "\n".join(lines).rstrip()
 
-        if section in {"ai_model", "ai_models_1m", "ai_models_10m", "ai_models_gemini"}:
+        if section in {"ai_model", "ai_models_1m", "ai_models_10m", "ai_models_gemini", "ai_models_deepseek"}:
             provider = self._ai_provider()
             model = self._ai_model(provider)
             if section == "ai_models_1m":
@@ -995,6 +1016,8 @@ class SlaveRuntime:
                 title = "⚡ OpenAI модели: 10M token group"
             elif section == "ai_models_gemini":
                 title = "✨ Gemini модели"
+            elif section == "ai_models_deepseek":
+                title = "🐳 DeepSeek модели"
             else:
                 title = "🧬 Модель AI"
             return (
@@ -1232,6 +1255,7 @@ class SlaveRuntime:
             return InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
+                        _ai_provider_button("DeepSeek", "deepseek", provider),
                         _ai_provider_button("OpenAI", "openai", provider),
                         _ai_provider_button("Gemini", "gemini", provider),
                     ],
@@ -1282,9 +1306,10 @@ class SlaveRuntime:
                     [InlineKeyboardButton(text="⬅️ Назад к AI", callback_data="s|nav|ai")],
                 ]
             else:
+                presets = DEEPSEEK_MODEL_PRESETS if provider == "deepseek" else GEMINI_MODEL_PRESETS
                 rows = [
                     [InlineKeyboardButton(text=model, callback_data=f"s|ai_model|{model}")]
-                    for model in GEMINI_MODEL_PRESETS
+                    for model in presets
                 ]
                 rows.extend(
                     [
@@ -1677,6 +1702,8 @@ class SlaveRuntime:
             ai_settings["openai_model"] = "gpt-5-mini"
         if provider == "gemini" and not ai_settings.get("gemini_model"):
             ai_settings["gemini_model"] = "gemini-3.5-flash"
+        if provider == "deepseek" and not ai_settings.get("deepseek_model"):
+            ai_settings["deepseek_model"] = "deepseek-flash"
         await self._update_setting("ai", ai_settings)
 
     async def _set_ai_model_checked(self, provider: str, model: str) -> tuple[bool, str]:
@@ -1884,7 +1911,7 @@ class SlaveRuntime:
     def _ai_provider(self) -> str:
         ai_settings = self.settings.get("ai", {})
         provider = self.analyzer.resolve_provider(ai_settings)
-        return provider if provider in AI_PROVIDER_LABELS else "openai"
+        return provider if provider in AI_PROVIDER_LABELS else "deepseek"
 
     def _ai_configured(self) -> bool:
         return self.analyzer.is_configured(self.settings.get("ai", {}))
@@ -1893,6 +1920,8 @@ class SlaveRuntime:
         ai_settings = self.settings.get("ai", {})
         if provider == "gemini":
             return str(ai_settings.get("gemini_model") or "gemini-3.5-flash")
+        if provider == "deepseek":
+            return str(ai_settings.get("deepseek_model") or self.analyzer.settings.deepseek_model)
         return str(ai_settings.get("openai_model") or "gpt-5-mini")
 
     def _ai_full_prompt(self) -> str:
@@ -2232,6 +2261,8 @@ class SlaveRuntime:
             return
 
         key = (message.chat.id, message.message_id)
+        if len(self.pending) >= PENDING_SUBMISSIONS_LIMIT:
+            self.pending.pop(next(iter(self.pending)))
         self.pending[key] = message
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -2249,6 +2280,11 @@ class SlaveRuntime:
             await callback.answer()
             return
         message = self.pending.pop(key, None)
+        if not message and callback.message:
+            # The confirmation replies to the submission, so it is still at hand after a restart cleared `pending`.
+            original = callback.message.reply_to_message
+            if original and (original.chat.id, original.message_id) == key and original.from_user:
+                message = original
         if not message:
             await callback.answer(self._t("repeat_submission"), show_alert=True)
             return
@@ -2419,6 +2455,14 @@ class SlaveRuntime:
             ai_result = None
             await self._notify_health("ai_failed", "⚠️ AI analysis failed. Moderation still works, but AI result is missing.")
 
+        if ai_result and ai_result.failed:
+            await self._notify_health(
+                "ai_failed",
+                f"⚠️ AI analysis failed ({AI_PROVIDER_LABELS.get(provider, provider)}, {model}). "
+                "Moderation still works; submissions wait for the AI verdict and are retried every 30 minutes. "
+                "Check the API key and balance.",
+            )
+            ai_result = None
         analysis_text = ai_result.text if ai_result else self._t("ai_analysis_failed")
         try:
             await self.pool.execute(
@@ -2910,6 +2954,7 @@ class SlaveRuntime:
     async def _timeout_loop(self) -> None:
         try:
             while True:
+                await self._retry_failed_ai_analysis()
                 await self._expire_old_votes()
                 await asyncio.sleep(300)
         except asyncio.CancelledError:
@@ -2972,11 +3017,50 @@ class SlaveRuntime:
                 self.data_retention_days,
             )
 
+    def _ai_verdict_missing(self, row: asyncpg.Record) -> bool:
+        """The AI is expected to judge this submission but has not (yet): still running or the provider failed."""
+        if not row["ai_provider"] or not self._ai_enabled():
+            return False
+        return row["ai_analysis"] is None or row["ai_analysis"] in AI_FAILURE_TEXTS
+
+    async def _retry_failed_ai_analysis(self) -> None:
+        if not self._ai_enabled() or time.monotonic() - self.last_ai_retry < AI_RETRY_INTERVAL_SECONDS:
+            return
+        self.last_ai_retry = time.monotonic()
+        rows = await self.pool.fetch(
+            """
+            SELECT original_chat_id, id, message
+            FROM incoming_messages
+            WHERE bot_id = $1
+                AND is_voting_success = FALSE
+                AND is_voting_fail = FALSE
+                AND is_published = FALSE
+                AND ai_provider IS NOT NULL
+                AND ai_analysis = ANY($2::text[])
+                AND created_at >= NOW() - ($3::int * interval '1 hour')
+            ORDER BY created_at
+            LIMIT 20
+            """,
+            self.bot_id,
+            list(AI_FAILURE_TEXTS),
+            AI_RETRY_MAX_HOURS,
+        )
+        provider = self._ai_provider()
+        model = self._ai_model(provider)
+        for row in rows:
+            try:
+                message = _restore_message(row["message"], self.bot)
+            except Exception:
+                LOGGER.warning("Unable to restore message #%s/%s for AI retry", row["original_chat_id"], row["id"])
+                continue
+            LOGGER.info("Retrying AI analysis for bot #%s message #%s/%s", self.bot_id, row["original_chat_id"], row["id"])
+            await self._run_ai_analysis(message, row["original_chat_id"], row["id"], provider, model)
+
     async def _expire_old_votes(self) -> None:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT original_chat_id, id, ai_analysis, ai_recommendation, ai_publish_score
+                SELECT original_chat_id, id, created_at, ai_provider, ai_analysis, ai_recommendation, ai_publish_score
                 FROM incoming_messages
                 WHERE bot_id = $1
                     AND is_voting_success = FALSE
@@ -2992,6 +3076,14 @@ class SlaveRuntime:
             expired: list[asyncpg.Record] = []
             for row in rows:
                 counts = await self._vote_counts(conn, row["original_chat_id"], row["id"])
+                if (
+                    self._ai_auto_publish_enabled()
+                    and counts.get("no", 0) == 0
+                    and self._ai_verdict_missing(row)
+                    and row["created_at"] >= _utcnow() - timedelta(hours=AI_RETRY_MAX_HOURS)
+                ):
+                    # Without the AI verdict the timeout would reject everything; wait for the retry instead.
+                    continue
                 if self._ai_auto_publish_allowed(row, counts):
                     updated = await conn.fetchrow(
                         """
@@ -3738,6 +3830,10 @@ def _chat_type(message: Message) -> str:
     return message.chat.type.value if hasattr(message.chat.type, "value") else str(message.chat.type)
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _enabled_label(value: bool) -> str:
     return "🟢 включено" if value else "⚪ выключено"
 
@@ -3779,12 +3875,29 @@ def _valid_chat_id(value: str) -> bool:
 
 
 def _message_dump(message: Message) -> dict[str, Any]:
+    # No exclude_defaults: it drops discriminators such as forward_origin.type, and the dump could not be restored.
     return message.model_dump(
         mode="json",
         by_alias=True,
         exclude_none=True,
-        exclude_defaults=True,
     )
+
+
+FORWARD_ORIGIN_TYPES = (
+    ("sender_user", "user"),
+    ("sender_user_name", "hidden_user"),
+    ("sender_chat", "chat"),
+    ("chat", "channel"),
+)
+
+
+def _restore_message(raw: Any, bot: Bot) -> Message:
+    data = raw if isinstance(raw, dict) else json.loads(raw)
+    origin = data.get("forward_origin")
+    if isinstance(origin, dict) and "type" not in origin:
+        # Older dumps lost the discriminator; the remaining fields tell the origin type.
+        origin["type"] = next((kind for field, kind in FORWARD_ORIGIN_TYPES if field in origin), "user")
+    return Message.model_validate(data).as_(bot)
 
 
 def _html(value: Any) -> str:
