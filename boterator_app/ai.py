@@ -25,7 +25,7 @@ SYSTEM_PROMPTS = {
         "написан ли текст ИИ: оценивай только признаки и риски. Дай субъективные проценты. "
         "Ответ строго до 650 символов, без таблиц и длинных пояснений, ровно 4 строки:\n"
         "🧭 Вердикт: опубликовать/проверить/отклонить | шанс публикации NN%\n"
-        "🤖 AI-текст: NN%\n"
+        "🧬 Риск неаутентичности: NN%\n"
         "🧪 Сигналы: 2-3 коротких признака\n"
         "⚠️ Риски: 1-2 коротких риска"
     ),
@@ -36,7 +36,7 @@ SYSTEM_PROMPTS = {
         "Give subjective percentages. Keep the answer under 650 characters, with no "
         "tables or long explanations, exactly 4 lines:\n"
         "🧭 Verdict: publish/review/reject | publish chance NN%\n"
-        "🤖 AI-written: NN%\n"
+        "🧬 Authenticity risk: NN%\n"
         "🧪 Signals: 2-3 short signals\n"
         "⚠️ Risks: 1-2 short risks"
     ),

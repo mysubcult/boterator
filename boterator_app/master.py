@@ -60,10 +60,14 @@ class MasterBot:
     def _register_handlers(self) -> None:
         @self.router.message(CommandStart())
         async def start(message: Message) -> None:
+            owner_note = ""
+            if self.settings.master_owner_id:
+                owner_note = "\n\n🔒 Регистрация новых ботов доступна только владельцу Boterator."
             await message.answer(
                 "🤖 Это master-бот Boterator.\n\n"
                 "🚀 Команда /reg зарегистрирует отдельного бота, который будет принимать "
                 "сообщения от авторов, отправлять их модераторам и публиковать одобренное в канал."
+                f"{owner_note}"
             )
 
         @self.router.message(Command("cancel"))
@@ -75,6 +79,9 @@ class MasterBot:
         @self.router.message(Command("reg"))
         async def reg(message: Message) -> None:
             if not message.from_user:
+                return
+            if not self._can_register_bot(message):
+                await message.answer("🚫 Регистрация новых ботов доступна только владельцу Boterator.")
                 return
             slave_settings = copy.deepcopy(DEFAULT_SLAVE_SETTINGS)
             self.states[message.from_user.id] = RegistrationState(
@@ -90,7 +97,8 @@ class MasterBot:
                 return
             state = self.states.get(message.from_user.id)
             if not state:
-                await message.answer("🚀 Используйте /reg, чтобы начать регистрацию бота.")
+                if self._can_register_bot(message):
+                    await message.answer("🚀 Используйте /reg, чтобы начать регистрацию бота.")
                 return
             if state.step == "token":
                 await self._handle_token(message, state)
@@ -207,6 +215,11 @@ class MasterBot:
             f"✅ Готово. @{state.bot_username} принимает сообщения и отправляет их на модерацию.\n\n"
             "⚙️ Настройки доступны владельцу в личке с зарегистрированным ботом: /settings."
         )
+
+    def _can_register_bot(self, message: Message) -> bool:
+        if not message.from_user:
+            return False
+        return self.settings.master_owner_id is None or message.from_user.id == self.settings.master_owner_id
 
 
 async def wait_for_moderation_group(bot: Bot, username: str, timeout_seconds: int) -> dict[str, Any] | None:

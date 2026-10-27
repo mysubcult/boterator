@@ -8,6 +8,7 @@ from dataclasses import dataclass
 class Settings:
     master_token: str
     database_url: str
+    master_owner_id: int | None = None
     log_level: str = "INFO"
     publish_mode: str = "forward"
     registration_timeout_seconds: int = 600
@@ -41,6 +42,7 @@ class Settings:
         return cls(
             master_token=master_token,
             database_url=database_url,
+            master_owner_id=_optional_int(os.getenv("MASTER_OWNER_ID")),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             publish_mode=publish_mode,
             registration_timeout_seconds=int(os.getenv("REGISTRATION_TIMEOUT_SECONDS", "600")),
@@ -53,3 +55,8 @@ class Settings:
             data_retention_days=max(1, int(os.getenv("DATA_RETENTION_DAYS", "90"))),
             cleanup_interval_hours=max(1, int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))),
         )
+
+
+def _optional_int(value: str | None) -> int | None:
+    value = (value or "").strip()
+    return int(value) if value else None
