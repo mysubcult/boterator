@@ -5,21 +5,21 @@
       "name": "mildlyinteresting",
       "subreddit": "mildlyinteresting",
       "sort": "top",
-      "period": "day",
+      "period": "week",
       "style": "photos",
       "channel": "@mildlyinteresting",
       "bot_id": 422727809,
-      "rss_url": "https://www.reddit.com/r/mildlyinteresting/top/.rss?sort=top&t=day"
+      "rss_url": "https://www.reddit.com/r/mildlyinteresting/top/.rss?sort=top&t=week"
     },
     {
       "name": "showerthoughts",
       "subreddit": "showerthoughts",
       "sort": "top",
-      "period": "day",
+      "period": "week",
       "style": "thought",
       "channel": "@showerthoughts",
       "bot_id": 337970525,
-      "rss_url": "https://www.reddit.com/r/Showerthoughts/top/.rss?t=day"
+      "rss_url": "https://www.reddit.com/r/Showerthoughts/top/.rss?t=week"
     },
     {
       "name": "todayilearned",
