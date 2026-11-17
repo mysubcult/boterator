@@ -48,3 +48,18 @@ cd /opt/boterator && git pull && docker compose up -d --build app && docker logs
 Тестов в репозитории нет. Проверять в одноразовом контейнере образа `boterator-app` с сетью `boterator_default`
 и отдельной базой (`create database boterator_test` в контейнере postgres), живые заявки не трогать.
 Коммиты — от `mysubcult <mysubcult1@gmail.com>`.
+
+## Reddit RSS — с 17.11.2026
+
+- Отдельный Compose-сервис `reddit`, контейнер `boterator-reddit-1`, в этом же
+  проекте; код `boterator_app/reddit_feed.py`, настройки `reddit-feeds.json`,
+  подключение `docker-compose.reddit.yml`. Основной `app` при запуске не перезапускался.
+- Отправитель `@Reddit_poster_robot` — администратор `@mildlyinteresting`,
+  `@showerthoughts`, `@todayilearned`; токен `/root/.secrets/reddit-publisher.env` (600).
+- Решение владельца: публичный RSS, без заявки на Reddit API; три старых апплета
+  IFTTT владелец подтвердил выключенными. При первом успешном чтении старая лента
+  становится baseline, далее опрос раз в 15 минут, не более одного поста на канал/цикл.
+- Полные галереи из RSS пока не подтверждены: неполные отмечаются `held`, не отправляются
+  одной миниатюрой. 403/429 от Reddit возможны. Управление, статусы, ограничения,
+  тесты и откат — `agent-docs/reddit-feeds.md`. При пересоздании worker требуется
+  `REDDIT_PUBLISH_ENABLED=1`; без этого отправка не включится.
