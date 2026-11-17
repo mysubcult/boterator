@@ -1,0 +1,8 @@
+{
+  "poll_seconds": 900,
+  "feeds": [
+    {"name": "mildlyinteresting", "subreddit": "mildlyinteresting", "sort": "top", "period": "day", "style": "photos", "channel": "@mildlyinteresting", "bot_id": 422727809},
+    {"name": "showerthoughts", "subreddit": "showerthoughts", "sort": "top", "period": "week", "style": "thought", "channel": "@showerthoughts", "bot_id": 337970525},
+    {"name": "todayilearned", "subreddit": "todayilearned", "sort": "hot", "style": "source", "channel": "@todayilearned", "bot_id": 337970525}
+  ]
+}

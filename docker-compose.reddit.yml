@@ -1,0 +1,26 @@
+# Optional worker in the SAME Boterator project/network/database.
+# Build from reviewed checkout; do not replace the existing app service.
+services:
+  reddit:
+    image: boterator-reddit:20261117
+    build:
+      context: .
+      dockerfile: Dockerfile.reddit
+    command: ["python", "-m", "boterator_app.reddit_feed", "run"]
+    restart: unless-stopped
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    mem_limit: 160m
+    cpus: 0.25
+    env_file:
+      - /opt/boterator/.env
+      - /root/.secrets/reddit-publisher.env
+    environment:
+      REDDIT_PUBLISH_ENABLED: "${REDDIT_PUBLISH_ENABLED:-0}"
+      REDDIT_SOURCE: rss
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"

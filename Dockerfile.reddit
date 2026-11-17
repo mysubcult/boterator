@@ -1,0 +1,5 @@
+# Reuse the locally deployed dependency image; add only the feed worker.
+FROM boterator-app
+COPY boterator_app/reddit_feed.py /app/boterator_app/reddit_feed.py
+COPY reddit-feeds.json /app/reddit-feeds.json
+CMD ["python", "-m", "boterator_app.reddit_feed", "run"]
