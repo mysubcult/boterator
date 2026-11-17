@@ -48,7 +48,7 @@ class DatabaseFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.bot.send_message.await_count,1)
         self.reddit.fetch.return_value = [Post('t3_repost','New','https://example.org','https://reddit.com')]
         await cycle(self.conn,self.reddit,self.feed,'run')
-        self.assertEqual(self.bot.send_message.await_count,1)
+        self.assertEqual(self.bot.send_message.await_count,2)
 
     async def test_uncertain_send_blocks_next_poll(self):
         await cycle(self.conn,self.reddit,self.feed,'init')
@@ -78,6 +78,31 @@ class DatabaseFlow(unittest.IsolatedAsyncioTestCase):
         await cycle(self.conn,self.reddit,self.feed,'run')
         self.assertEqual(await self.conn.fetchval("SELECT status FROM reddit_feed_posts WHERE post_id='t3_gallery'"),'sent')
         self.bot.send_photo.assert_awaited_once()
+
+    async def test_every_new_entry_is_published_in_one_poll(self):
+        await cycle(self.conn,self.reddit,self.feed,'init')
+        self.reddit.fetch.return_value = [Post('t3_'+str(i),'New '+str(i),'https://example.org','https://reddit.com') for i in range(4)]
+        await cycle(self.conn,self.reddit,self.feed,'run')
+        self.assertEqual(self.bot.send_message.await_count,4)
+        await cycle(self.conn,self.reddit,self.feed,'run')
+        self.assertEqual(self.bot.send_message.await_count,4)
+
+    async def test_source_change_seeds_archive_without_reposting(self):
+        self.feed.update(subreddit='test',sort='top',period='day')
+        await cycle(self.conn,self.reddit,self.feed,'init')
+        self.feed['period']='week'
+        self.reddit.fetch.return_value=[self.old,self.new]
+        await cycle(self.conn,self.reddit,self.feed,'run')
+        self.bot.send_message.assert_not_called()
+        self.assertEqual(await self.conn.fetchval("SELECT status FROM reddit_feed_posts WHERE post_id='t3_new'"),'baseline')
+
+    async def test_failure_keeps_other_entries_in_durable_queue(self):
+        await cycle(self.conn,self.reddit,self.feed,'init')
+        self.reddit.fetch.return_value=[Post('t3_'+str(i),'New '+str(i),'https://example.org','https://reddit.com') for i in range(3)]
+        self.bot.send_message.side_effect=TimeoutError()
+        await cycle(self.conn,self.reddit,self.feed,'run')
+        self.assertEqual(await self.conn.fetchval("SELECT COUNT(*) FROM reddit_feed_posts WHERE status='pending'"),2)
+        self.assertEqual(await self.conn.fetchval("SELECT COUNT(*) FROM reddit_feed_posts WHERE status='sending'"),1)
 
     async def test_second_worker_cannot_take_lock(self):
         await self.conn.fetchval('SELECT pg_try_advisory_lock(74236918024)')

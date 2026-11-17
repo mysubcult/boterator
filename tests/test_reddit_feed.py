@@ -1,14 +1,16 @@
 import asyncio
 import html
 import unittest
-from unittest.mock import AsyncMock
+import time
+from urllib.error import HTTPError
+from unittest.mock import AsyncMock, patch
 from types import SimpleNamespace
 
 from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
 
 from boterator_app.reddit_feed import (Post, SourceError, from_json, from_rss, plan,
-                                       split_text, utf16len, deliver, cycle)
+                                       split_text, utf16len, deliver, cycle, Reddit)
 
 
 class Rendering(unittest.TestCase):
@@ -45,6 +47,7 @@ class Rendering(unittest.TestCase):
         self.assertEqual(plan(p, 'thought'), [{'method':'send_message','text':'A &lt; B &amp; C','preview':False}])
         op = plan(p, 'source')[0]
         self.assertTrue(op['preview'])
+        self.assertEqual(op['text'], 'A &lt; B &amp; C [<a href="https://example.org/source">Source</a>]')
         self.assertIn('href="https://example.org/source">Source</a>', op['text'])
 
     def test_incomplete_gallery_is_never_sent(self):
@@ -83,6 +86,18 @@ class Rendering(unittest.TestCase):
     def test_block_page_is_not_an_empty_feed(self):
         with self.assertRaises(SourceError):
             from_rss(b'<html><body>Blocked</body></html>')
+
+
+class Transport(unittest.TestCase):
+    def test_rss_retry_after_is_honoured(self):
+        client = Reddit(None)
+        url = 'https://www.reddit.com/r/test/top/.rss?t=week'
+        error = HTTPError(url,429,'rate limit',{'Retry-After':'1800'},None)
+        with patch('boterator_app.reddit_feed.urlopen',side_effect=error):
+            with self.assertRaises(SourceError):
+                client.read_rss(url)
+        self.assertGreater(client.blocked_until[url],time.monotonic()+1790)
+
 
 
 class Delivery(unittest.IsolatedAsyncioTestCase):

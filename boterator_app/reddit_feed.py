@@ -17,7 +17,9 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlencode
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 import aiohttp
 from aiogram import Bot
@@ -38,6 +40,7 @@ CREATE TABLE IF NOT EXISTS reddit_feed_posts (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (feed, post_id)
 );
+ALTER TABLE reddit_feed_state ADD COLUMN IF NOT EXISTS source_key TEXT;
 CREATE INDEX IF NOT EXISTS reddit_feed_fingerprint ON reddit_feed_posts(feed, fingerprint);
 """
 
@@ -208,10 +211,10 @@ def plan(post: Post, style: str) -> list[dict]:
         return [{"method": "send_message", "text": html.escape(t), "preview": False} for t in split_text(text)]
     if style == "source":
         chunks = split_text(text)
-        source = f'<a href="{html.escape(post.url, quote=True)}">Source</a>'
+        source = f'[<a href="{html.escape(post.url, quote=True)}">Source</a>]'
         ops = [{"method": "send_message", "text": html.escape(t), "preview": False} for t in chunks]
-        if utf16len(chunks[-1]) + 8 <= 4096:
-            ops[-1]["text"] += "\n\n" + source
+        if utf16len(chunks[-1]) + 9 <= 4096:
+            ops[-1]["text"] += " " + source
             ops[-1]["preview"] = True
             ops[-1]["preview_url"] = post.url
         else:
@@ -301,9 +304,31 @@ class Reddit:
             except (KeyError, ValueError, TypeError):
                 raise SourceError("Unexpected Reddit JSON response") from None
         rss_params = {"sort": "top", "t": feed.get("period", "day")} if feed["sort"] == "top" else {}
-        raw = await self.request("GET", "https://www.reddit.com" + path + "/.rss",
-                                 headers=self.headers, params=rss_params)
+        rss_url = feed.get("rss_url") or "https://www.reddit.com" + path + "/.rss" + ("?" + urlencode(rss_params) if rss_params else "")
+        if time.monotonic() < self.blocked_until.get(rss_url, 0):
+            raise SourceError("Reddit rate limit cooldown; retry later")
+        raw = await asyncio.to_thread(self.read_rss, rss_url)
         return from_rss(raw)
+
+    def read_rss(self, url):
+        # This standard HTTP client is verified against all three canonical feeds
+        # from the worker network. It runs in a thread to avoid blocking asyncio.
+        try:
+            with urlopen(Request(url, headers=self.headers), timeout=40) as response:
+                raw = response.read(4 * 1024 * 1024 + 1)
+                if len(raw) > 4 * 1024 * 1024:
+                    raise SourceError("Reddit response exceeds size limit")
+                return raw
+        except HTTPError as exc:
+            if exc.code == 429:
+                try:
+                    cooldown = max(900, int(exc.headers.get("Retry-After", "900")))
+                except ValueError:
+                    cooldown = 3600
+                self.blocked_until[url] = time.monotonic() + cooldown
+            raise SourceError(f"Reddit HTTP {exc.code}; retry next poll") from None
+        except (URLError, TimeoutError, OSError):
+            raise SourceError("Reddit network error; retry next poll") from None
 
 
 def load_config(path):
@@ -318,6 +343,10 @@ def load_config(path):
             raise ValueError("Invalid feed mode")
         if f.get("period") not in {None, "day", "week", "month", "year", "all"}:
             raise ValueError("Invalid top period")
+        if f.get("rss_url"):
+            url = urlsplit(f["rss_url"])
+            if url.scheme != "https" or url.netloc != "www.reddit.com" or not url.path.endswith(".rss"):
+                raise ValueError("RSS must be a public Reddit HTTPS feed")
         if not re.fullmatch(r"@[A-Za-z0-9_]+", f["channel"]):
             raise ValueError("Invalid channel")
     return config
@@ -398,46 +427,51 @@ async def cycle(conn, reddit, feed, mode):
             except SourceError as exc:
                 print(json.dumps({"feed": name, "post_id": post.id, "held": str(exc)}, ensure_ascii=False))
         return
-    initialized = await conn.fetchval("SELECT TRUE FROM reddit_feed_state WHERE feed=$1", name)
-    if not initialized:
+    source_key = f"{feed.get('subreddit', name)}:{feed.get('sort', 'hot')}:{feed.get('period', '')}"
+    initialized = await conn.fetchval("SELECT source_key FROM reddit_feed_state WHERE feed=$1", name)
+    if initialized != source_key:
         async with conn.transaction():
             for p in posts:
                 await conn.execute("""INSERT INTO reddit_feed_posts(feed,post_id,fingerprint,status)
                     VALUES($1,$2,$3,'baseline') ON CONFLICT DO NOTHING""", name, p.id, p.fingerprint)
-            await conn.execute("INSERT INTO reddit_feed_state(feed) VALUES($1)", name)
+            await conn.execute("""INSERT INTO reddit_feed_state(feed,source_key) VALUES($1,$2)
+                ON CONFLICT(feed) DO UPDATE SET source_key=EXCLUDED.source_key""", name, source_key)
         LOG.info("%s initialized without sending historical posts", name)
         return
     if mode == "init":
         LOG.info("%s already initialized; baseline unchanged", name)
         return
+    # Journal every new RSS entry BEFORE attempting Telegram delivery. A failed
+    # operation must not lose the other entries when they leave the RSS window.
+    for p in posts:
+        known = await conn.fetchrow("SELECT status FROM reddit_feed_posts WHERE feed=$1 AND post_id=$2", name, p.id)
+        if known and known["status"] != "held":
+            continue
+        try:
+            operations = plan(p, feed["style"])
+        except SourceError as exc:
+            await conn.execute("""INSERT INTO reddit_feed_posts(feed,post_id,fingerprint,status)
+                VALUES($1,$2,$3,'held') ON CONFLICT DO NOTHING""", name, p.id, p.fingerprint)
+            LOG.warning("%s %s held: %s", name, p.id, exc)
+            continue
+        await conn.execute("""INSERT INTO reddit_feed_posts(feed,post_id,fingerprint,status,operations)
+            VALUES($1,$2,$3,'pending',$4) ON CONFLICT (feed,post_id) DO UPDATE
+            SET status='pending',operations=EXCLUDED.operations,updated_at=NOW()
+            WHERE reddit_feed_posts.status='held'""", name, p.id, p.fingerprint, operations)
+    pending = await conn.fetch("SELECT * FROM reddit_feed_posts WHERE feed=$1 AND status='pending' ORDER BY created_at,post_id", name)
+    if not pending:
+        return
     bot = await bot_for(conn, feed)
     try:
         await check_bot(bot, feed)
-        # Persist at most one new post per poll to avoid bursts. Existing queued
-        # operations resume from their checkpoint, including multi-album posts.
-        pending = await conn.fetchrow("SELECT * FROM reddit_feed_posts WHERE feed=$1 AND status='pending' ORDER BY created_at LIMIT 1", name)
-        if pending:
-            if pending["retry_at"] and pending["retry_at"].timestamp() > time.time():
+        for row in pending:
+            if row["retry_at"] and row["retry_at"].timestamp() > time.time():
                 return
-            await deliver(conn, bot, feed, pending)
-            return
-        for p in posts:
-            known = await conn.fetchrow("SELECT post_id,status FROM reddit_feed_posts WHERE feed=$1 AND (post_id=$2 OR fingerprint=$3) ORDER BY (post_id=$2) DESC LIMIT 1", name, p.id, p.fingerprint)
-            if known and (known["post_id"] != p.id or known["status"] != "held"):
-                continue
-            try:
-                operations = plan(p, feed["style"])
-            except SourceError as exc:
-                await conn.execute("""INSERT INTO reddit_feed_posts(feed,post_id,fingerprint,status)
-                    VALUES($1,$2,$3,'held') ON CONFLICT DO NOTHING""", name, p.id, p.fingerprint)
-                LOG.warning("%s %s held: %s", name, p.id, exc)
-                continue
-            row = await conn.fetchrow("""INSERT INTO reddit_feed_posts(feed,post_id,fingerprint,status,operations)
-                VALUES($1,$2,$3,'pending',$4) ON CONFLICT (feed,post_id) DO UPDATE
-                SET status='pending',operations=EXCLUDED.operations,updated_at=NOW()
-                WHERE reddit_feed_posts.status='held' RETURNING *""", name, p.id, p.fingerprint, operations)
             await deliver(conn, bot, feed, row)
-            break
+            status = await conn.fetchval("SELECT status FROM reddit_feed_posts WHERE feed=$1 AND post_id=$2", name, row["post_id"])
+            if status != "sent":
+                return
+            await asyncio.sleep(2)
     finally:
         await bot.session.close()
 
@@ -477,8 +511,11 @@ async def amain(args):
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=40)) as session:
             reddit = Reddit(session)
             while True:
+                started = time.monotonic()
                 failures = 0
-                for feed in config["feeds"]:
+                for index, feed in enumerate(config["feeds"]):
+                    if index:
+                        await asyncio.sleep(60)
                     try:
                         await cycle(conn, reddit, feed, mode)
                     except SourceError as exc:
@@ -491,7 +528,7 @@ async def amain(args):
                     if failures:
                         raise SourceError(f"{failures} feed(s) failed")
                     break
-                await asyncio.sleep(max(900, config.get("poll_seconds", 900)))
+                await asyncio.sleep(max(1, max(900, config.get("poll_seconds", 900)) - (time.monotonic() - started)))
     finally:
         if pool:
             if conn:

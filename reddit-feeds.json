@@ -1,8 +1,35 @@
 {
   "poll_seconds": 900,
   "feeds": [
-    {"name": "mildlyinteresting", "subreddit": "mildlyinteresting", "sort": "top", "period": "day", "style": "photos", "channel": "@mildlyinteresting", "bot_id": 422727809},
-    {"name": "showerthoughts", "subreddit": "showerthoughts", "sort": "top", "period": "week", "style": "thought", "channel": "@showerthoughts", "bot_id": 337970525},
-    {"name": "todayilearned", "subreddit": "todayilearned", "sort": "hot", "style": "source", "channel": "@todayilearned", "bot_id": 337970525}
+    {
+      "name": "mildlyinteresting",
+      "subreddit": "mildlyinteresting",
+      "sort": "top",
+      "period": "week",
+      "style": "photos",
+      "channel": "@mildlyinteresting",
+      "bot_id": 422727809,
+      "rss_url": "https://www.reddit.com/r/mildlyinteresting/top/.rss?sort=top&t=week"
+    },
+    {
+      "name": "showerthoughts",
+      "subreddit": "showerthoughts",
+      "sort": "top",
+      "period": "week",
+      "style": "thought",
+      "channel": "@showerthoughts",
+      "bot_id": 337970525,
+      "rss_url": "https://www.reddit.com/r/Showerthoughts/top/.rss?t=week"
+    },
+    {
+      "name": "todayilearned",
+      "subreddit": "todayilearned",
+      "sort": "top",
+      "style": "source",
+      "channel": "@todayilearned",
+      "bot_id": 337970525,
+      "period": "week",
+      "rss_url": "https://www.reddit.com/r/todayilearned/top/.rss?t=week"
+    }
   ]
 }
