@@ -50,30 +50,6 @@ cd /opt/boterator && git pull && docker compose up -d --build app && docker logs
 ## Проверка
 
 Тесты запускаются командой `python -m unittest discover -s tests -v`. Для интеграционных
-тестов использовать одноразовый PostgreSQL с отдельными базами `boterator_moderation_test`
-и `boterator_reddit_test_20261117`, задав URL через `MODERATION_TEST_DATABASE_URL`
-и `REDDIT_TEST_DATABASE_URL`. Telegram в тестах подменяется.
+тестов использовать одноразовый PostgreSQL с базой `boterator_moderation_test`, задав URL
+через `MODERATION_TEST_DATABASE_URL`. Telegram в тестах подменяется.
 Коммиты — от `mysubcult <mysubcult1@gmail.com>`.
-
-## Reddit RSS — с 17.11.2026
-
-С 17 ноября публичные RSS больше не отдают записи для всех трёх лент. На 19 ноября
-у владельца нет одобренного доступа к Reddit Data API. Права отправителя Telegram
-подтверждены. Подробности и порядок подключения доступного источника — в `agent-docs/reddit-feeds.md`.
-
-- Отдельный Compose-сервис `reddit`, контейнер `boterator-reddit-1`, в этом же
-  проекте; код `boterator_app/reddit_feed.py`, настройки `reddit-feeds.json`,
-  подключение `docker-compose.reddit.yml`. Основной `app` при запуске не перезапускался.
-- Отправитель `@Reddit_poster_robot` — администратор `@mildlyinteresting`,
-  `@showerthoughts`, `@todayilearned`; токен `/root/.secrets/reddit-publisher.env` (600).
-- Решение владельца: публичный RSS, без заявки на Reddit API; три старых апплета
-  IFTTT владелец подтвердил выключенными. При первом успешном чтении старая лента
-  становится baseline, далее опрос раз в 15 минут, публикация всех новых ID.
-  Ленты: Mildly — top/week, Shower — top/week, TIL — hot. Дневной квоты
-  и случайных задержек нет. По решению владельца приоритет — более строгий недельный отбор. TIL: `[Source]`
-  сразу в конце текста, превью включено. При смене источника — новая baseline без
-  рассылки архива. Примерный объём 5–15/сутки — пожелание, не гарантия.
-- Полные галереи из RSS пока не подтверждены: неполные отмечаются `held`, не отправляются
-  одной миниатюрой. 403/429 от Reddit возможны. Управление, статусы, ограничения,
-  тесты и откат — `agent-docs/reddit-feeds.md`. При пересоздании worker требуется
-  `REDDIT_PUBLISH_ENABLED=1`; без этого отправка не включится.
