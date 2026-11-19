@@ -19,7 +19,6 @@ services:
       - /root/.secrets/reddit-publisher.env
     environment:
       REDDIT_PUBLISH_ENABLED: "${REDDIT_PUBLISH_ENABLED:-0}"
-      REDDIT_SOURCE: rss
     logging:
       options:
         max-size: "5m"

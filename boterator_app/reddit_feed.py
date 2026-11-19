@@ -244,6 +244,9 @@ def plan(post: Post, style: str) -> list[dict]:
 class Reddit:
     def __init__(self, session):
         self.session = session
+        self.source = os.getenv("REDDIT_SOURCE", "rss")
+        if self.source not in {"rss", "oauth"}:
+            raise SourceError("REDDIT_SOURCE must be rss or oauth")
         self.token = None
         self.blocked_until = {}
         self.expires = 0
@@ -295,7 +298,7 @@ class Reddit:
         if feed.get("period"):
             params["t"] = feed["period"]
         path = f'/r/{feed["subreddit"]}/{feed["sort"]}'
-        if os.getenv("REDDIT_SOURCE", "rss") == "oauth":
+        if self.source == "oauth":
             raw = await self.request("GET", "https://oauth.reddit.com" + path,
                                      headers=await self.oauth_headers(), params=params)
             try:
@@ -320,6 +323,8 @@ class Reddit:
                     raise SourceError("Reddit response exceeds size limit")
                 return raw
         except HTTPError as exc:
+            if exc.code == 404:
+                raise SourceError("Reddit RSS HTTP 404 (public RSS retired); verify the configured source") from None
             if exc.code == 429:
                 try:
                     cooldown = max(900, int(exc.headers.get("Retry-After", "900")))
@@ -428,12 +433,21 @@ async def cycle(conn, reddit, feed, mode):
                 print(json.dumps({"feed": name, "post_id": post.id, "held": str(exc)}, ensure_ascii=False))
         return
     source_key = f"{feed.get('subreddit', name)}:{feed.get('sort', 'hot')}:{feed.get('period', '')}"
+    # Keep the existing key for RSS installations. Switching transports seeds
+    # the current listing once, even if both list the same subreddit and sort.
+    if reddit.source == "oauth":
+        source_key = f"oauth:{source_key}"
     initialized = await conn.fetchval("SELECT source_key FROM reddit_feed_state WHERE feed=$1", name)
     if initialized != source_key:
         async with conn.transaction():
+            if await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM reddit_feed_posts
+                    WHERE feed=$1 AND status IN ('pending','sending','failed'))""", name):
+                raise SourceError("Previous source has unfinished deliveries; reconcile before switching")
             for p in posts:
                 await conn.execute("""INSERT INTO reddit_feed_posts(feed,post_id,fingerprint,status)
-                    VALUES($1,$2,$3,'baseline') ON CONFLICT DO NOTHING""", name, p.id, p.fingerprint)
+                    VALUES($1,$2,$3,'baseline') ON CONFLICT (feed,post_id) DO UPDATE
+                    SET status='baseline',updated_at=NOW() WHERE reddit_feed_posts.status='held'""",
+                                   name, p.id, p.fingerprint)
             await conn.execute("""INSERT INTO reddit_feed_state(feed,source_key) VALUES($1,$2)
                 ON CONFLICT(feed) DO UPDATE SET source_key=EXCLUDED.source_key""", name, source_key)
         LOG.info("%s initialized without sending historical posts", name)
@@ -512,21 +526,21 @@ async def amain(args):
             reddit = Reddit(session)
             while True:
                 started = time.monotonic()
-                failures = 0
+                failed_feeds = []
                 for index, feed in enumerate(config["feeds"]):
                     if index:
                         await asyncio.sleep(60)
                     try:
                         await cycle(conn, reddit, feed, mode)
                     except SourceError as exc:
-                        failures += 1
+                        failed_feeds.append(feed["name"])
                         LOG.error("%s: %s", feed["name"], exc)
                     except Exception as exc:
-                        failures += 1
+                        failed_feeds.append(feed["name"])
                         LOG.error("%s: %s (details suppressed to protect credentials)", feed["name"], type(exc).__name__)
                 if mode != "run":
-                    if failures:
-                        raise SourceError(f"{failures} feed(s) failed")
+                    if failed_feeds:
+                        raise SourceError(f"Failed feeds: {', '.join(failed_feeds)}")
                     break
                 await asyncio.sleep(max(1, max(900, config.get("poll_seconds", 900)) - (time.monotonic() - started)))
     finally:

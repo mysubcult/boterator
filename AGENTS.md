@@ -28,7 +28,11 @@
 - Оценка: модель ставит `fit`, `quality`, `clarity` от 0 до 3, флаги `spam`/`unsafe`/`off_topic` и
   `authenticity_risk` low/medium/high. Решает код (`ai.rubric_decision`): флаг, high или оценка < 2 → reject;
   сумма в % ≥ `auto_publish_min_score` (75 = 7 из 9) → publish; на балл ниже → review («на грани», для модераторов).
-  Результат у самого порога спрашивается ещё 2 раза, берётся медиана. Автору при отказе уходит `author_note`.
+  Результат у самого порога спрашивается ещё 2 раза, берётся медиана.
+- Для трёх приёмников в `registered_bots.settings.ai.required_language` задано `en`.
+  Проверяется язык основного текста, подписи и текста произведения на изображении.
+  Результат `non_english` закрывает заявку сразу после проверки. Автору отправляются
+  статус и редакционная причина. Оценки и разбор доступны в чате модераторов.
 - Автопубликация: через `vote_timeout` (1 ч) пост без голосов «против» публикуется, если вердикт publish.
   Иначе — отказ (`ai_reject` / `timeout`).
 - Если ИИ не ответил — пост не отклоняется по таймауту, анализ повторяется раз в 30 мин до 48 ч; владельцу приходит
@@ -45,11 +49,17 @@ cd /opt/boterator && git pull && docker compose up -d --build app && docker logs
 
 ## Проверка
 
-Тестов в репозитории нет. Проверять в одноразовом контейнере образа `boterator-app` с сетью `boterator_default`
-и отдельной базой (`create database boterator_test` в контейнере postgres), живые заявки не трогать.
+Тесты запускаются командой `python -m unittest discover -s tests -v`. Для интеграционных
+тестов использовать одноразовый PostgreSQL с отдельными базами `boterator_moderation_test`
+и `boterator_reddit_test_20261117`, задав URL через `MODERATION_TEST_DATABASE_URL`
+и `REDDIT_TEST_DATABASE_URL`. Telegram в тестах подменяется.
 Коммиты — от `mysubcult <mysubcult1@gmail.com>`.
 
 ## Reddit RSS — с 17.11.2026
+
+С 17 ноября публичные RSS больше не отдают записи для всех трёх лент. На 19 ноября
+у владельца нет одобренного доступа к Reddit Data API. Права отправителя Telegram
+подтверждены. Подробности и порядок подключения доступного источника — в `agent-docs/reddit-feeds.md`.
 
 - Отдельный Compose-сервис `reddit`, контейнер `boterator-reddit-1`, в этом же
   проекте; код `boterator_app/reddit_feed.py`, настройки `reddit-feeds.json`,

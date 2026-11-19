@@ -101,11 +101,14 @@ CREATE TABLE IF NOT EXISTS incoming_messages (
     message JSONB NOT NULL,
     moderation_message_id BIGINT,
     moderation_fwd_message_id BIGINT,
+    moderation_fwd_chat_id BIGINT,
     ai_provider TEXT,
     ai_model TEXT,
     ai_analysis TEXT,
     ai_recommendation TEXT,
     ai_publish_score INTEGER,
+    submission_language TEXT,
+    ai_reason_code TEXT,
     ai_auto_approved BOOLEAN NOT NULL DEFAULT FALSE,
     reject_reason TEXT,
     reject_note TEXT,
@@ -138,11 +141,14 @@ CREATE TABLE IF NOT EXISTS votes_history (
     vote_yes BOOLEAN NOT NULL
 );
 
+ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS moderation_fwd_chat_id BIGINT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_provider TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_model TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_analysis TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_recommendation TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_publish_score INTEGER;
+ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS submission_language TEXT;
+ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_reason_code TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS ai_auto_approved BOOLEAN NOT NULL DEFAULT FALSE;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS reject_reason TEXT;
 ALTER TABLE incoming_messages ADD COLUMN IF NOT EXISTS reject_note TEXT;

@@ -152,7 +152,7 @@ Unknown public commands are ignored or answered as unknown commands; they do not
 
 ## AI Behavior
 
-AI analysis is optional. If AI is disabled or unavailable, moderation continues normally.
+Each registered bot can use AI moderation. Set `settings.ai.required_language` to `en` to require English for that bot. The check covers the submission text, caption and readable writing that carries the submission in an image. English submissions may contain foreign names and short quotations. Submissions without linguistic content continue through the channel's regular content checks.
 
 When enabled:
 
@@ -160,18 +160,18 @@ When enabled:
 - The moderation status message first shows that AI is checking the submission.
 - AI runs in a background task with a timeout.
 - The same moderation status message is edited with the compact AI result.
-- Moderators can vote before or after AI finishes.
+- Approval opens once a required language check passes. A non-English result closes the submission immediately and invites the author to submit an English version.
 - The owner can view and replace the full AI system prompt in `/settings` or with `/setaiprompt`. This prompt is used for the AI verdict and therefore also affects AI auto-publish decisions.
 
 If AI fails, times out, or the model/API key is invalid:
 
 - the message stays in moderation;
-- moderator voting continues;
+- submissions that require a language check wait for a successful check before approval;
 - the owner gets a health alert (at most once an hour);
 - with AI auto-publish enabled, the vote timeout does not reject the message while the AI verdict is missing: the analysis is retried every 30 minutes, and only after 48 hours without a verdict does the usual timeout apply;
 - the failure is logged, but the bot process keeps running.
 
-The system prompt describes the channel and what the scores mean for it; the bot appends the answer format itself. The model returns JSON with three scores from 0 to 3 (`fit`, `quality`, `clarity`), hard flags (`spam`, `unsafe`, `off_topic`), `authenticity_risk` (low/medium/high), short signals and risks, and a polite note for the author. The bot decides: any flag, high authenticity risk, or a score below 2 rejects; otherwise the total as a percentage of 9 must reach the AI auto-publish threshold (default 75%, i.e. 7 of 9); one point short is shown as `review`. Results right at the threshold are asked two more times and the median decides. When a submission is rejected by the AI, the author receives the author note. A prompt that still contains the old `publish chance NN%` answer line keeps the old behaviour (verdict and percentage from the model). Prompts are limited to 4096 characters (one Telegram message).
+The system prompt describes the channel and what the scores mean for it; the bot appends the answer format itself. The model returns JSON with three scores from 0 to 3 (`fit`, `quality`, `clarity`), hard flags (`spam`, `unsafe`, `off_topic`), `authenticity_risk` (low/medium/high), short signals and risks, and a polite note for the author. The bot decides: any flag, high authenticity risk, or a score below 2 rejects; otherwise the total as a percentage of 9 must reach the AI auto-publish threshold (default 75%, i.e. 7 of 9); one point short is shown as `review`. Results right at the threshold are asked two more times and the median decides. The moderator card contains the detailed assessment. Authors receive a short editorial reason from a fixed list. A prompt that still contains the old `publish chance NN%` answer line keeps the old behaviour (verdict and percentage from the model). Prompts are limited to 4096 characters (one Telegram message).
 
 DeepSeek and OpenAI model changes are checked with the current API key before saving. Gemini models are checked through the Gemini model list and a small `generateContent` test.
 
@@ -184,7 +184,7 @@ The moderation message includes buttons for:
 - contacting the author through the bot;
 - banning the author.
 
-When a moderator clicks reject, the bot asks for a reason. The author receives the standard rejection message plus the selected reason or custom moderator note. Raw AI analysis is shown only to moderators. If AI auto-publish is enabled and a timed-out submission is rejected by the AI decision, the author receives a neutral rejection reason derived from the AI analysis without AI labels or scores. When a moderator clicks contact or ban, the bot asks for the next message in the moderator chat. `/cancel` cancels the pending action. A ban stores `banned_at` and `ban_reason`, blocks future submissions from that user, and closes their active not-yet-approved moderation records.
+When a moderator clicks reject, the bot asks for a reason. The author receives the standard rejection message plus the selected reason or custom moderator note. Automated rejections use the same public format, with an editorial reason such as language, clarity or fit. When a moderator clicks contact or ban, the bot asks for the next message in the moderator chat. `/cancel` cancels the pending action. A ban stores `banned_at` and `ban_reason`, blocks future submissions from that user, and closes their active not-yet-approved moderation records.
 
 ## Duplicate Detection
 
@@ -200,7 +200,7 @@ Owners can change `/settings` -> `Auto filter` per registered bot. Rules for lin
 
 - `off`: do nothing;
 - `warning-only`: show a warning in the moderator card, but keep voting open;
-- `auto-reject`: forward the submission to moderators, close it as rejected, and skip AI analysis.
+- `auto-reject`: close matching submissions with the filter reason. Channels that require English check the language first.
 
 ## Moving Moderator Chat
 

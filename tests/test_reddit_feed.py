@@ -1,5 +1,6 @@
 import asyncio
 import html
+import os
 import unittest
 import time
 from urllib.error import HTTPError
@@ -10,7 +11,7 @@ from aiogram.exceptions import TelegramRetryAfter
 from aiogram.methods import SendMessage
 
 from boterator_app.reddit_feed import (Post, SourceError, from_json, from_rss, plan,
-                                       split_text, utf16len, deliver, cycle, Reddit)
+                                       split_text, utf16len, deliver, cycle, Reddit, amain)
 
 
 class Rendering(unittest.TestCase):
@@ -89,6 +90,11 @@ class Rendering(unittest.TestCase):
 
 
 class Transport(unittest.TestCase):
+    def test_invalid_source_reports_configuration_error(self):
+        with patch.dict(os.environ, {'REDDIT_SOURCE': 'oahtu'}):
+            with self.assertRaisesRegex(SourceError, 'REDDIT_SOURCE'):
+                Reddit(None)
+
     def test_rss_retry_after_is_honoured(self):
         client = Reddit(None)
         url = 'https://www.reddit.com/r/test/top/.rss?t=week'
@@ -101,6 +107,17 @@ class Transport(unittest.TestCase):
 
 
 class Delivery(unittest.IsolatedAsyncioTestCase):
+    async def test_oauth_fetch_keeps_the_configured_weekly_listing(self):
+        with patch.dict(os.environ, {'REDDIT_SOURCE': 'oauth'}):
+            client = Reddit(None)
+        feed = {'subreddit': 'mildlyinteresting', 'sort': 'top', 'period': 'week'}
+        with (patch.object(client, 'oauth_headers', AsyncMock(return_value={'Authorization': 'Bearer mock'})),
+              patch.object(client, 'request', AsyncMock(return_value=b'{"data":{"children":[]}}')) as get):
+            self.assertEqual(await client.fetch(feed), [])
+        get.assert_awaited_once_with('GET', 'https://oauth.reddit.com/r/mildlyinteresting/top',
+                                    headers={'Authorization': 'Bearer mock'},
+                                    params={'limit': '25', 'raw_json': '1', 't': 'week'})
+
     def row(self):
         return dict(post_id='t3_a',next_operation=0,
                     operations=[{'method':'send_message','text':'hello','preview':False}])
@@ -139,6 +156,18 @@ class Delivery(unittest.IsolatedAsyncioTestCase):
     async def test_preview_does_not_need_database_or_telegram(self):
         reddit = SimpleNamespace(fetch=AsyncMock(return_value=[Post('t3_a','A','https://example.org','https://reddit.com')]))
         await cycle(None, reddit, {'name':'test','style':'thought','channel':'@test'}, 'preview')
+
+    async def test_preview_reports_each_failed_feed_and_checks_the_rest(self):
+        feeds = [{'name': name} for name in ('a', 'b', 'c')]
+        cycle_stub = AsyncMock(side_effect=[SourceError('not found'), None, SourceError('no access')])
+        with (patch('boterator_app.reddit_feed.load_config', return_value={'feeds': feeds}),
+              patch('boterator_app.reddit_feed.create_pool') as pool,
+              patch('boterator_app.reddit_feed.cycle', cycle_stub),
+              patch('boterator_app.reddit_feed.asyncio.sleep', new_callable=AsyncMock)):
+            with self.assertRaisesRegex(SourceError, 'Failed feeds: a, c'):
+                await amain(SimpleNamespace(config='unused', mode='preview'))
+        self.assertEqual([call.args[2] for call in cycle_stub.await_args_list], feeds)
+        pool.assert_not_called()
 
 
 if __name__ == '__main__':

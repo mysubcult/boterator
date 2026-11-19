@@ -13,7 +13,7 @@ import asyncpg
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ChatType, ParseMode
-from aiogram.exceptions import TelegramAPIError, TelegramMigrateToChat
+from aiogram.exceptions import TelegramAPIError, TelegramMigrateToChat, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 
@@ -94,6 +94,7 @@ REJECT_REASONS = {
     "silent": "No public reason",
     "not_our_cup": "Not our cup of tea.",
     "off_topic": "Off-topic",
+    "non_english": "Not in English",
     "low_quality": "Low quality",
     "ai_like": "AI-like",
     "spam": "Spam",
@@ -121,6 +122,8 @@ REJECT_REASON_LABELS = {
         "timeout": "Не одобрено за время модерации",
         "ai_reject": "AI предложил отклонить",
         "custom": "Комментарий модератора",
+        "non_english": "Канал принимает заявки на английском языке. Вы можете прислать английскую версию.",
+        "language_check_expired": "Не удалось завершить проверку языка за 48 часов. Вы можете прислать заявку ещё раз.",
         "auto_link": "Обнаружена ссылка",
         "auto_profanity": "Обнаружена грубая лексика",
         "auto_test": "Тестовое сообщение",
@@ -138,6 +141,8 @@ REJECT_REASON_LABELS = {
         "timeout": "Not approved during moderation",
         "ai_reject": "AI suggested rejection",
         "custom": "Moderator note",
+        "non_english": "This channel accepts submissions in English. You're welcome to send an English version.",
+        "language_check_expired": "We couldn't complete the language check within 48 hours. You're welcome to submit again.",
         "auto_link": "Link detected",
         "auto_profanity": "Strong profanity detected",
         "auto_test": "Test/placeholder detected",
@@ -151,7 +156,26 @@ AUTO_FILTER_NEXT_MODE = {
     "reject": "off",
 }
 
-AUTHOR_HIDDEN_REJECT_REASONS = {"silent", "no_vote", "timeout", "ai_reject"}
+AUTHOR_REASONS = {
+    "en": {
+        "guidelines": "This submission does not meet the channel's editorial guidelines.",
+        "quality": "The submission needs a more developed or distinctive idea.",
+        "fit": "This submission does not fit the channel's theme.",
+        "clarity": "The main idea is difficult to follow.",
+        "originality": "We could not establish that this submission is original.",
+        "no_vote": "The submission did not receive moderator approval.",
+        "timeout": "The submission did not receive enough approvals before voting closed.",
+    },
+    "ru": {
+        "guidelines": "Заявка не соответствует редакционным требованиям канала.",
+        "quality": "Идею стоит подробнее раскрыть или придать ей больше оригинальности.",
+        "fit": "Заявка не соответствует тематике канала.",
+        "clarity": "Основную мысль трудно понять.",
+        "originality": "Не удалось подтвердить оригинальность заявки.",
+        "no_vote": "Заявка не получила одобрения модераторов.",
+        "timeout": "За время голосования заявка не набрала достаточно голосов.",
+    },
+}
 
 LINK_RE = re.compile(
     r"(?i)(https?://|www\.|t\.me/|telegram\.me/|discord\.gg/|"
@@ -341,15 +365,24 @@ class SlaveRuntime:
         await self.bot.session.close()
 
     async def _run(self) -> None:
-        try:
-            await self.bot.delete_webhook(drop_pending_updates=False)
-            await self.dp.start_polling(self.bot, allowed_updates=self.dp.resolve_used_update_types())
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            LOGGER.exception("Slave bot #%s stopped unexpectedly", self.bot_id)
-            await self._notify_health("polling", "⚠️ Slave bot polling stopped unexpectedly. The bot was marked inactive.")
-            await self.pool.execute("UPDATE registered_bots SET active = FALSE WHERE id = $1", self.bot_id)
+        backoff = 5
+        while True:
+            try:
+                await self.bot.delete_webhook(drop_pending_updates=False)
+                await self.dp.start_polling(self.bot, allowed_updates=self.dp.resolve_used_update_types())
+                return
+            except TelegramRetryAfter as exc:
+                delay = max(1, exc.retry_after)
+            except (TelegramNetworkError, TelegramServerError, TimeoutError):
+                delay = backoff
+                backoff = min(120, backoff * 2)
+            except Exception:
+                LOGGER.exception("Slave bot #%s stopped unexpectedly", self.bot_id)
+                await self._notify_health("polling", "⚠️ Slave bot polling stopped unexpectedly. The bot was marked inactive.")
+                await self.pool.execute("UPDATE registered_bots SET active = FALSE WHERE id = $1", self.bot_id)
+                return
+            LOGGER.warning("Telegram polling for bot #%s will retry in %ss", self.bot_id, delay)
+            await asyncio.sleep(delay)
 
     def _register_handlers(self) -> None:
         @self.router.message(CommandStart())
@@ -2311,84 +2344,76 @@ class SlaveRuntime:
             await callback.answer()
             return
 
+        requires_english = self.settings.get("ai", {}).get("required_language") == "en"
+        if requires_english and not self._ai_enabled():
+            if callback.message:
+                await callback.message.edit_text(self._t("language_check_unavailable"))
+            await callback.answer()
+            return
+
         if callback.message:
             await callback.message.edit_text(self._t("sending_to_mods"))
         await callback.answer()
 
-        raw_message = _message_dump(message)
-        normalized_text = _normalize_submission_text(message)
-        media_unique_id = _media_unique_id(message)
-        auto_filter_match = self._auto_filter_match(message, normalized_text)
-        auto_filter_reason = auto_filter_match[0] if auto_filter_match else None
-        auto_reject_reason = auto_filter_reason if auto_filter_match and auto_filter_match[1] == "reject" else None
-        duplicate = await self._find_duplicate(normalized_text, media_unique_id, message.chat.id, message.message_id)
-        ai_enabled = self._ai_enabled() and auto_reject_reason is None
-        ai_provider = self._ai_provider() if ai_enabled else None
-        ai_model = self._ai_model(ai_provider) if ai_provider else None
-
-        await self.pool.execute(
+        inserted = await self.pool.fetchval(
             """
-            INSERT INTO incoming_messages (
-                id, original_chat_id, owner_id, bot_id, message, ai_provider, ai_model, ai_analysis,
-                ai_recommendation, ai_publish_score, ai_auto_approved, normalized_text, media_unique_id,
-                auto_filter_reason, duplicate_of_original_chat_id, duplicate_of_message_id, duplicate_score,
-                is_voting_fail, reject_reason, rejected_at
-            )
-            VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, FALSE, $11, $12, $13, $14, $15,
-                $16, $17, $18, CASE WHEN $17 THEN NOW() ELSE NULL END
-            )
+            INSERT INTO incoming_messages (id, original_chat_id, owner_id, bot_id, message, submission_language)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (bot_id, original_chat_id, id) DO UPDATE SET
-                message = EXCLUDED.message,
-                ai_provider = EXCLUDED.ai_provider,
-                ai_model = EXCLUDED.ai_model,
-                ai_analysis = EXCLUDED.ai_analysis,
-                ai_recommendation = EXCLUDED.ai_recommendation,
-                ai_publish_score = EXCLUDED.ai_publish_score,
-                normalized_text = EXCLUDED.normalized_text,
-                media_unique_id = EXCLUDED.media_unique_id,
-                auto_filter_reason = EXCLUDED.auto_filter_reason,
-                duplicate_of_original_chat_id = EXCLUDED.duplicate_of_original_chat_id,
-                duplicate_of_message_id = EXCLUDED.duplicate_of_message_id,
-                duplicate_score = EXCLUDED.duplicate_score,
-                ai_auto_approved = FALSE,
-                reject_reason = EXCLUDED.reject_reason,
-                reject_note = NULL,
-                rejected_by = NULL,
-                rejected_at = EXCLUDED.rejected_at,
-                is_voting_fail = EXCLUDED.is_voting_fail,
-                is_voting_success = FALSE,
-                is_published = FALSE
+                is_voting_fail = FALSE, reject_reason = NULL, rejected_at = NULL,
+                submission_language = EXCLUDED.submission_language, ai_provider = NULL
+            WHERE incoming_messages.is_voting_fail AND incoming_messages.moderation_message_id IS NULL
+                AND (incoming_messages.reject_reason IS NULL OR incoming_messages.reject_reason = 'moderation_send_failed')
+                AND NOT incoming_messages.is_published AND NOT incoming_messages.is_voting_success
+            RETURNING TRUE
             """,
-            message.message_id,
-            message.chat.id,
-            callback.from_user.id,
-            self.bot_id,
-            raw_message,
-            ai_provider,
-            ai_model,
-            None,
-            None,
-            None,
-            normalized_text,
-            media_unique_id,
-            auto_filter_reason,
-            duplicate["original_chat_id"] if duplicate else None,
-            duplicate["id"] if duplicate else None,
-            duplicate["score"] if duplicate else None,
-            auto_reject_reason is not None,
-            auto_reject_reason,
+            message.message_id, message.chat.id, callback.from_user.id, self.bot_id, _message_dump(message),
+            "pending" if requires_english else None,
         )
+        if not inserted:
+            if callback.message:
+                await callback.message.edit_text(self._t("sent_to_moderation"))
+            return
 
         try:
-            moderation_copy = await self._copy_or_forward(self.moderator_chat_id, message.chat.id, message.message_id)
-            moderation_fwd_id = moderation_copy.message_id
+            snapshot = await self._moderation_snapshot(message)
+            # Telegram's forwarded copy includes the act of forwarding to the moderators. The submission's
+            # own forwarding metadata is the one relevant to the editorial rubric.
+            content = snapshot.model_copy(update={
+                "chat": message.chat, "message_id": message.message_id, "from_user": message.from_user,
+                "date": message.date, "forward_origin": message.forward_origin,
+            })
+            normalized_text = _normalize_submission_text(content)
+            media_unique_id = _media_unique_id(content)
+            auto_filter = self._auto_filter_match(content, normalized_text)
+            filter_reason = auto_filter[0] if auto_filter else None
+            reject_reason = filter_reason if auto_filter and auto_filter[1] == "reject" else None
+            reject_now = bool(reject_reason and not requires_english)
+            duplicate = await self._find_duplicate(normalized_text, media_unique_id, message.chat.id, message.message_id)
+            ai_enabled = self._ai_enabled() and not reject_now
+            ai_provider = self._ai_provider() if ai_enabled else None
+            ai_model = self._ai_model(ai_provider) if ai_provider else None
+            await self.pool.execute(
+                """
+                UPDATE incoming_messages SET
+                    message = $4, moderation_fwd_chat_id = $5, moderation_fwd_message_id = $6,
+                    ai_provider = $7, ai_model = $8, normalized_text = $9, media_unique_id = $10,
+                    auto_filter_reason = $11, duplicate_of_original_chat_id = $12,
+                    duplicate_of_message_id = $13, duplicate_score = $14, is_voting_fail = $15,
+                    reject_reason = $16, rejected_at = CASE WHEN $15 THEN NOW() ELSE NULL END
+                WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
+                """,
+                self.bot_id, message.chat.id, message.message_id, _message_dump(content), snapshot.chat.id,
+                snapshot.message_id, ai_provider, ai_model, normalized_text, media_unique_id, filter_reason,
+                duplicate["original_chat_id"] if duplicate else None, duplicate["id"] if duplicate else None,
+                duplicate["score"] if duplicate else None, reject_now, reject_reason,
+            )
             status_text, keyboard = await self._verification_message(
                 message.message_id,
                 message.chat.id,
-                auto_reject_reason is not None,
+                reject_now,
             )
-            moderation_status = await self._send_moderation_status(status_text, keyboard, moderation_fwd_id)
+            moderation_status = await self._send_moderation_status(status_text, keyboard, snapshot.message_id)
         except TelegramAPIError:
             LOGGER.exception("Unable to send moderation request for bot #%s", self.bot_id)
             await self._notify_health(
@@ -2396,7 +2421,8 @@ class SlaveRuntime:
                 "⚠️ Could not send a submission to the moderator chat. Check bot permissions and moderator chat.",
             )
             await self.pool.execute(
-                "UPDATE incoming_messages SET is_voting_fail = TRUE WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3",
+                """UPDATE incoming_messages SET is_voting_fail = TRUE, reject_reason = 'moderation_send_failed'
+                   WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3""",
                 self.bot_id,
                 message.chat.id,
                 message.message_id,
@@ -2408,12 +2434,10 @@ class SlaveRuntime:
         await self.pool.execute(
             """
             UPDATE incoming_messages
-            SET moderation_message_id = $1,
-                moderation_fwd_message_id = $2
-            WHERE bot_id = $3 AND original_chat_id = $4 AND id = $5
+            SET moderation_message_id = $1
+            WHERE bot_id = $2 AND original_chat_id = $3 AND id = $4
             """,
             moderation_status.message_id,
-            moderation_fwd_id,
             self.bot_id,
             message.chat.id,
             message.message_id,
@@ -2424,12 +2448,12 @@ class SlaveRuntime:
         )
         if callback.message:
             await callback.message.edit_text(self._t("sent_to_moderation"))
-        if auto_reject_reason:
-            await self._notify_rejection_author(message.chat.id, message.message_id, "author_rejected")
+        if reject_now:
+            await self._notify_rejection_author(message.chat.id, message.message_id)
             return
         if ai_enabled:
             asyncio.create_task(
-                self._run_ai_analysis(message, message.chat.id, message.message_id, ai_provider, ai_model),
+                self._run_ai_analysis(content, message.chat.id, message.message_id, ai_provider, ai_model, requires_english),
                 name=f"slave-{self.bot_id}-ai-{message.chat.id}-{message.message_id}",
             )
 
@@ -2440,12 +2464,15 @@ class SlaveRuntime:
         message_id: int,
         provider: str | None,
         model: str | None,
+        requires_english: bool = False,
     ) -> None:
         if not provider or not model:
             return
         ai_settings = dict(self.settings.get("ai", {}))
         ai_settings["provider"] = provider
         ai_settings[f"{provider}_model"] = model
+        if requires_english:
+            ai_settings["required_language"] = "en"
 
         try:
             ai_result = await asyncio.wait_for(
@@ -2480,16 +2507,27 @@ class SlaveRuntime:
             )
             ai_result = None
         analysis_text = ai_result.text if ai_result else self._t("ai_analysis_failed")
+        submission_language = ai_result.submission_language if ai_result else None
         try:
-            await self.pool.execute(
+            updated = await self.pool.fetchval(
                 """
                 UPDATE incoming_messages
                 SET ai_provider = $1,
                     ai_model = $2,
                     ai_analysis = $3,
                     ai_recommendation = $4,
-                    ai_publish_score = $5
+                    ai_publish_score = $5,
+                    ai_reason_code = $9,
+                    submission_language = COALESCE($10::text, submission_language),
+                    is_voting_fail = CASE WHEN $10 = 'non_english' THEN TRUE
+                        WHEN $10 IN ('english', 'no_text') AND reject_reason IS NOT NULL THEN TRUE ELSE FALSE END,
+                    reject_reason = CASE WHEN $10 = 'non_english' THEN 'non_english' ELSE reject_reason END,
+                    rejected_at = CASE WHEN $10 = 'non_english' OR
+                        ($10 IN ('english', 'no_text') AND reject_reason IS NOT NULL) THEN NOW() ELSE rejected_at END
                 WHERE bot_id = $6 AND original_chat_id = $7 AND id = $8
+                    AND NOT is_voting_success AND NOT is_voting_fail AND NOT is_published
+                    AND (submission_language IS NULL OR submission_language = 'pending')
+                RETURNING CASE WHEN is_voting_fail THEN reject_reason ELSE '' END
                 """,
                 provider,
                 model,
@@ -2499,7 +2537,13 @@ class SlaveRuntime:
                 self.bot_id,
                 original_chat_id,
                 message_id,
+                ai_result.public_reason_code if ai_result else None,
+                submission_language,
             )
+            if updated is None:
+                return
+            if updated:
+                await self._notify_rejection_author(original_chat_id, message_id)
             await self._refresh_moderation_status(
                 original_chat_id,
                 message_id,
@@ -2533,7 +2577,7 @@ class SlaveRuntime:
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT is_voting_fail, is_voting_success, is_published
+                SELECT is_voting_fail, is_voting_success, is_published, submission_language
                 FROM incoming_messages
                 WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
                 """,
@@ -2544,6 +2588,9 @@ class SlaveRuntime:
             if not row or row["is_voting_fail"] or row["is_voting_success"] or row["is_published"]:
                 await callback.answer(self._t("voting_closed"))
                 await self._refresh_moderation_status(original_chat_id, message_id, True)
+                return
+            if row["submission_language"] == "pending" and vote_yes:
+                await callback.answer(self._t("checking_language"), show_alert=True)
                 return
 
             previous = await conn.fetchval(
@@ -2585,16 +2632,22 @@ class SlaveRuntime:
                 )
                 await callback.answer(self._t("reject_reason_required_short"), show_alert=True)
             elif counts["yes"] >= self.settings["votes"]:
-                await conn.execute(
+                approved = await conn.fetchval(
                     """
                     UPDATE incoming_messages
                     SET is_voting_success = TRUE
-                    WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3 AND is_voting_fail = FALSE
+                    WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
+                        AND NOT is_voting_fail AND NOT is_voting_success AND NOT is_published
+                        AND submission_language IS DISTINCT FROM 'pending'
+                    RETURNING TRUE
                     """,
                     self.bot_id,
                     original_chat_id,
                     message_id,
                 )
+                if not approved:
+                    await callback.answer(self._t("voting_closed"))
+                    return
                 await self._notify_author(original_chat_id, message_id, self._t("author_approved"))
                 await callback.answer(self._t("vote_counted_approved"))
             else:
@@ -2683,7 +2736,7 @@ class SlaveRuntime:
             await self._delete_message_safely(callback.message.chat.id, callback.message.message_id)
             await callback.answer("⚠️ Message is already finished.", show_alert=True)
             return
-        await self._notify_rejection_author(original_chat_id, message_id, "author_rejected")
+        await self._notify_rejection_author(original_chat_id, message_id)
         await self._refresh_moderation_status(original_chat_id, message_id, True)
         await self._delete_message_safely(callback.message.chat.id, callback.message.message_id)
         await callback.answer(self._t("message_rejected"))
@@ -2821,7 +2874,7 @@ class SlaveRuntime:
                 await message.answer("⚠️ Message is already finished.", reply_to_message_id=message.message_id)
                 return True
 
-            await self._notify_rejection_author(original_chat_id, original_message_id, "author_rejected")
+            await self._notify_rejection_author(original_chat_id, original_message_id)
             await self._refresh_moderation_status(original_chat_id, original_message_id, True)
             if prompt_message_id:
                 await self._delete_message_safely(message.chat.id, prompt_message_id)
@@ -2923,6 +2976,7 @@ class SlaveRuntime:
                         AND is_voting_success = TRUE
                         AND is_voting_fail = FALSE
                         AND is_published = FALSE
+                        AND submission_language IS DISTINCT FROM 'pending'
                     ORDER BY created_at
                     LIMIT 1
                     """,
@@ -2932,7 +2986,14 @@ class SlaveRuntime:
                     return
 
             try:
-                published = await self._copy_or_forward(self.target_channel, row["original_chat_id"], row["id"])
+                # Both the moderation decision and the channel post use the bot's own immutable copy.
+                if not row["moderation_fwd_message_id"]:
+                    await self._notify_health("publish_missing_copy", "⚠️ A queued submission has no moderation copy to publish.")
+                    return
+                published = await self._send_by_publish_mode(
+                    self.target_channel, row["moderation_fwd_chat_id"] or self.moderator_chat_id,
+                    row["moderation_fwd_message_id"],
+                )
             except TelegramAPIError:
                 LOGGER.exception("Publishing failed for bot #%s message #%s", self.bot_id, row["id"])
                 await self._notify_health(
@@ -3045,14 +3106,15 @@ class SlaveRuntime:
         self.last_ai_retry = time.monotonic()
         rows = await self.pool.fetch(
             """
-            SELECT original_chat_id, id, message
+            SELECT original_chat_id, id, message, submission_language
             FROM incoming_messages
             WHERE bot_id = $1
                 AND is_voting_success = FALSE
                 AND is_voting_fail = FALSE
                 AND is_published = FALSE
                 AND ai_provider IS NOT NULL
-                AND ai_analysis = ANY($2::text[])
+                AND (ai_analysis = ANY($2::text[]) OR
+                     (ai_analysis IS NULL AND created_at < NOW() - interval '5 minutes'))
                 AND created_at >= NOW() - ($3::int * interval '1 hour')
             ORDER BY created_at
             LIMIT 20
@@ -3070,13 +3132,15 @@ class SlaveRuntime:
                 LOGGER.warning("Unable to restore message #%s/%s for AI retry", row["original_chat_id"], row["id"])
                 continue
             LOGGER.info("Retrying AI analysis for bot #%s message #%s/%s", self.bot_id, row["original_chat_id"], row["id"])
-            await self._run_ai_analysis(message, row["original_chat_id"], row["id"], provider, model)
+            await self._run_ai_analysis(message, row["original_chat_id"], row["id"], provider, model,
+                                        requires_english=row["submission_language"] == "pending")
 
     async def _expire_old_votes(self) -> None:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT original_chat_id, id, created_at, ai_provider, ai_analysis, ai_recommendation, ai_publish_score
+                SELECT original_chat_id, id, created_at, ai_provider, ai_analysis, ai_recommendation,
+                       ai_publish_score, submission_language
                 FROM incoming_messages
                 WHERE bot_id = $1
                     AND is_voting_success = FALSE
@@ -3093,14 +3157,13 @@ class SlaveRuntime:
             for row in rows:
                 counts = await self._vote_counts(conn, row["original_chat_id"], row["id"])
                 if (
-                    self._ai_auto_publish_enabled()
-                    and counts.get("no", 0) == 0
-                    and self._ai_verdict_missing(row)
+                    (row["submission_language"] == "pending" or
+                     (self._ai_auto_publish_enabled() and counts.get("no", 0) == 0 and self._ai_verdict_missing(row)))
                     and row["created_at"] >= _utcnow() - timedelta(hours=AI_RETRY_MAX_HOURS)
                 ):
                     # Without the AI verdict the timeout would reject everything; wait for the retry instead.
                     continue
-                if self._ai_auto_publish_allowed(row, counts):
+                if row["submission_language"] != "pending" and self._ai_auto_publish_allowed(row, counts):
                     updated = await conn.fetchrow(
                         """
                         UPDATE incoming_messages
@@ -3112,6 +3175,7 @@ class SlaveRuntime:
                             AND is_voting_success = FALSE
                             AND is_voting_fail = FALSE
                             AND is_published = FALSE
+                            AND submission_language IS DISTINCT FROM 'pending'
                         RETURNING original_chat_id, id
                         """,
                         self.bot_id,
@@ -3123,7 +3187,9 @@ class SlaveRuntime:
                     continue
 
                 reject_reason = "timeout"
-                if counts.get("no", 0) > 0:
+                if row["submission_language"] == "pending":
+                    reject_reason = "language_check_expired"
+                elif counts.get("no", 0) > 0:
                     reject_reason = "no_vote"
                 elif self._ai_rejection_reason_available(row):
                     reject_reason = "ai_reject"
@@ -3132,7 +3198,7 @@ class SlaveRuntime:
                     """
                     UPDATE incoming_messages
                     SET is_voting_fail = TRUE,
-                        reject_reason = COALESCE(reject_reason, $4),
+                        reject_reason = $4,
                         rejected_at = COALESCE(rejected_at, NOW())
                     WHERE bot_id = $1
                         AND original_chat_id = $2
@@ -3140,12 +3206,14 @@ class SlaveRuntime:
                         AND is_voting_success = FALSE
                         AND is_voting_fail = FALSE
                         AND is_published = FALSE
+                        AND submission_language IS NOT DISTINCT FROM $5
                     RETURNING original_chat_id, id
                     """,
                     self.bot_id,
                     row["original_chat_id"],
                     row["id"],
                     reject_reason,
+                    row["submission_language"],
                 )
                 if updated:
                     expired.append(updated)
@@ -3154,18 +3222,29 @@ class SlaveRuntime:
             await self._notify_author(row["original_chat_id"], row["id"], self._t("author_approved"))
             await self._refresh_moderation_status(row["original_chat_id"], row["id"], True)
         for row in expired:
-            await self._notify_rejection_author(row["original_chat_id"], row["id"], "vote_expired")
+            await self._notify_rejection_author(row["original_chat_id"], row["id"])
             await self._refresh_moderation_status(row["original_chat_id"], row["id"], True)
         if auto_approved:
             await self.publish_ready_messages()
 
-    async def _copy_or_forward(self, chat_id: int | str, from_chat_id: int, message_id: int):
+    async def _moderation_snapshot(self, message: Message) -> Message:
+        async def send(chat_id: int) -> Message:
+            if self._publish_mode() == "forward":
+                return await self.bot.forward_message(chat_id=chat_id, from_chat_id=message.chat.id, message_id=message.message_id)
+            method = message.send_copy(chat_id)
+            # Preserve Telegram media options omitted by aiogram's send_copy shortcut (e.g. voice captions).
+            for attr in ("caption", "caption_entities", "show_caption_above_media"):
+                if attr in type(method).model_fields and getattr(message, attr, None) is not None:
+                    setattr(method, attr, getattr(message, attr))
+            if "has_spoiler" in type(method).model_fields:
+                method.has_spoiler = message.has_media_spoiler
+            return await self.bot(method)
+
         try:
-            return await self._send_by_publish_mode(chat_id, from_chat_id, message_id)
+            return await send(self.moderator_chat_id)
         except TelegramMigrateToChat as exc:
-            new_chat_id = int(exc.migrate_to_chat_id)
-            await self._remember_migrated_chat(chat_id, new_chat_id)
-            return await self._send_by_publish_mode(new_chat_id, from_chat_id, message_id)
+            await self._remember_migrated_chat(self.moderator_chat_id, int(exc.migrate_to_chat_id))
+            return await send(self.moderator_chat_id)
 
     async def _send_by_publish_mode(self, chat_id: int | str, from_chat_id: int, message_id: int):
         if self._publish_mode() == "forward":
@@ -3208,6 +3287,7 @@ class SlaveRuntime:
                     messages.is_published,
                     messages.ai_provider,
                     messages.ai_model,
+                    messages.submission_language,
                     messages.ai_analysis,
                     messages.ai_recommendation,
                     messages.ai_publish_score,
@@ -3312,6 +3392,8 @@ class SlaveRuntime:
         no_threshold_pending = bool(row and no >= self.settings["votes"])
         if no_threshold_pending:
             lines.extend(["", _html(self._t("reject_reason_required_status"))])
+        if row and row["submission_language"] == "pending":
+            lines.extend(["", _html(self._t("checking_language"))])
 
         lines.extend(["", f"<b>{_html(self._t('moderation_question'))}</b>"])
         keyboard_rows: list[list[InlineKeyboardButton]] = []
@@ -3488,10 +3570,10 @@ class SlaveRuntime:
         self.health_alerts[key] = now
         await self._notify_owner(f"🩺 Health alert for bot #{self.bot_id}\n\n{text}")
 
-    async def _notify_rejection_author(self, chat_id: int, message_id: int, base_key: str) -> None:
+    async def _notify_rejection_author(self, chat_id: int, message_id: int) -> None:
         row = await self.pool.fetchrow(
             """
-            SELECT reject_reason, reject_note, ai_analysis
+            SELECT reject_reason, reject_note, ai_reason_code
             FROM incoming_messages
             WHERE bot_id = $1 AND original_chat_id = $2 AND id = $3
             """,
@@ -3499,17 +3581,10 @@ class SlaveRuntime:
             chat_id,
             message_id,
         )
-        reason = row["reject_reason"] if row else None
-        note = str(row["reject_note"] or "").strip() if row else ""
-        reason_label = _author_reject_reason_label(reason, self._language())
-        ai_reason = _public_ai_rejection_reason(row["ai_analysis"], self._language()) if reason == "ai_reject" and row else None
-        text = self._t(base_key)
-        if reason_label and not (str(reason) == "custom" and note):
-            text = f"{text}\n\n{self._t('author_reject_reason', reason=reason_label)}"
-        elif ai_reason:
-            text = f"{text}\n\n{self._t('author_reject_reason', reason=ai_reason)}"
-        if note:
-            text = f"{text}\n\n{self._t('author_reject_note', note=_preview_text(note, REJECT_NOTE_MAX_LENGTH))}"
+        if not row:
+            return
+        reason = _author_rejection_reason(row["reject_reason"], row["reject_note"], row["ai_reason_code"], self._language())
+        text = f"{self._t('author_rejected')}\n\n{self._t('author_reject_reason', reason=reason)}"
         await self._notify_author(chat_id, message_id, text)
 
     async def _moderation_action_row(self, original_chat_id: int, message_id: int) -> asyncpg.Record | None:
@@ -3986,10 +4061,21 @@ def _reject_reason_label(reason: Any, language: str = "en") -> str | None:
     return REJECT_REASONS.get(reason, reason.replace("_", " ").title())
 
 
-def _author_reject_reason_label(reason: Any, language: str = "en") -> str | None:
-    if not reason or str(reason) in AUTHOR_HIDDEN_REJECT_REASONS:
-        return None
-    return _reject_reason_label(reason, language)
+def _author_rejection_reason(reason: str | None, note: str | None, ai_code: str | None, language: str) -> str:
+    # Only moderator-entered notes and known public labels can reach the author.
+    labels = AUTHOR_REASONS[language]
+    if reason == "custom" and note and not _mentions_ai_disclosure(note):
+        return note.strip()
+    if reason == "ai_reject":
+        reason = ai_code
+    if reason == "ai_like":
+        return labels["originality"]
+    if reason in labels:
+        return labels[reason]
+    if reason in {"not_our_cup", "off_topic", "low_quality", "spam", "unsafe", "no_caption", "non_english", "language_check_expired",
+                  *AUTO_FILTER_REASONS}:
+        return REJECT_REASON_LABELS[language][reason]
+    return labels["guidelines"]
 
 
 def _auto_filter_warning_text(reason: Any, language: str = "en") -> str:
@@ -4030,64 +4116,12 @@ def _telegram_message_url(chat_id_or_username: str, message_id: Any) -> str | No
     return None
 
 
-def _public_ai_rejection_reason(analysis: Any, language: str) -> str | None:
-    text = str(analysis or "").strip()
-    if not text:
-        return None
-
-    author_notes: list[str] = []
-    preferred: list[str] = []
-    fallback: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        normalized = _strip_leading_markers(line)
-        lower = normalized.lower()
-        if _mentions_ai_disclosure(lower):
-            continue
-
-        label, sep, details = normalized.partition(":")
-        label = label.strip().lower()
-        details = details.strip() if sep else normalized
-        details = _clean_public_reason_fragment(details)
-        if not details:
-            continue
-
-        if label in {"for author", "автору"}:
-            author_notes.append(details)
-        elif label in {"риски", "risk", "risks", "сигналы", "signal", "signals"}:
-            preferred.append(details)
-        elif label in {"вердикт", "verdict", "authenticity risk", "риск неаутентичности", "flags", "флаги"} or "%" in details:
-            continue
-        elif "/3" in details:
-            continue
-        else:
-            fallback.append(details)
-
-    reason = _clean_public_reason_fragment("; ".join((author_notes or preferred or fallback)[:2]).strip())
-    if not reason:
-        if language == "en":
-            return "the submission does not fit the channel guidelines."
-        return "сообщение не подходит под правила канала."
-    return _preview_text(reason, 700)
-
-
-def _strip_leading_markers(value: str) -> str:
-    return re.sub(r"^[^\wА-Яа-яЁё]+", "", value).strip()
-
-
-def _clean_public_reason_fragment(value: str) -> str:
-    value = re.sub(r"\b\d{1,3}\s*%", "", value)
-    value = re.sub(r"\s+([,.;:])", r"\1", value)
-    value = re.sub(r"\s{2,}", " ", value)
-    return value.strip(" -|")
-
-
 def _mentions_ai_disclosure(value: str) -> bool:
     return bool(
         re.search(
-            r"\b(ai|ai-written|artificial intelligence|machine-written|generated|llm)\b|ии|нейросет|искусственн|сгенер",
+            r"\b(ai|a\.i|llm|ии|artificial intelligence|chatgpt|gpt\w*|deepseek|gemini)\b"
+            r"|нейросет|искусственн\w* интеллект|\b(?:model|algorithm) (?:rejected|flagged|scored)"
+            r"|\bмодель (?:отклонила|оценила|решила)",
             value,
             flags=re.IGNORECASE,
         )

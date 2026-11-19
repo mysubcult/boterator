@@ -1,4 +1,37 @@
-# Публикация RSS Reddit в Telegram
+# Публикация лент Reddit в Telegram
+
+## Состояние источника на 19 ноября 2026 года
+
+Reddit объявил об отключении публичного RSS с 13 ноября. На этом сервере
+последний успешный опрос трёх лент прошёл 17 ноября в 17:41–17:43 UTC.
+Со следующего цикла Reddit возвращал HTTP 404 и пустой Atom `Not Found`.
+19 ноября проверка прав подтвердила возможность публикации во всех трёх каналах.
+[Объявление Reddit](https://www.reddit.com/r/modnews/comments/1wubgvt/continuing_our_infrastructure_updates_whats/).
+
+Для публикации через Reddit Data API нужны действующие права приложения
+на чтение этих трёх лент. По состоянию на 19 ноября ключи в контейнере
+отсутствовали. Владелец может настроить уже одобренное приложение в существующем
+файле `/root/.secrets/reddit-publisher.env` (права 600) через переменные
+`REDDIT_SOURCE=oauth`, `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`.
+Без `REDDIT_SOURCE` worker использует RSS. Секреты читаются из файла
+Compose при каждом создании контейнера. Этот режим использует OAuth
+client credentials и требует возможности читать публичные listings
+конкретным приложением.
+Для новой интеграции Reddit описывает переход на Developer Platform (Devvit).
+Доступ для конкретных сообществ и возможность внешней доставки нужно проверить
+до подключения. Текущий worker поддерживает прежний разрешённый OAuth-доступ.
+[Руководство Reddit по миграции](https://developers.reddit.com/docs/guides/migrate/public-api).
+
+После сборки worker команды `check` и `preview` ниже позволяют независимо
+проверить права Telegram и чтение **всех** настроенных лент. `preview`
+выходит с ненулевым кодом и перечисляет проблемные ленты при ошибке чтения.
+Включать отправку можно после успешного чтения и проверки прав.
+При первом успешном опросе после перехода RSS ↔ OAuth текущие ID записываются
+как baseline. Последующие новые ID публикуются. Записи об отправленных постах
+и Telegram ID сохраняются. Если в прежней очереди есть незавершённые отправки,
+сначала сверить их с каналом по процедуре ниже.
+
+## Компоненты
 
 Один отправитель `@Reddit_poster_robot`, администратор каналов
 `@mildlyinteresting`, `@showerthoughts`, `@todayilearned`.
@@ -34,8 +67,7 @@ getUpdates не вызывает. Отправляет напрямую, без 
 Повторная проверка возможна, пока пост есть в ленте; ID остаётся в журнале и после
 выхода из неё. Автоматическое получение полного списка галереи только из текущего
 RSS не подтверждено. Переданный в `plan()` полный список поддерживается и проверен
-тестами. Дополнительный режим OAuth существует для будущего доступа, но по решению
-владельца используется RSS и заявки на API не нужны для этого запуска.
+тестами. В режиме OAuth worker читает метаданные галерей из ответа Reddit Data API.
 
 Запросы трёх лент разнесены на 60 секунд внутри 15-минутного цикла, чтобы
 не обращаться к Reddit пачкой. Для RSS используется стандартный загрузчик Python.
@@ -73,7 +105,7 @@ Timeout, потерянный ответ, авария между Telegram и з
 docker compose -f docker-compose.yml -f docker-compose.reddit.yml build reddit
 # Только права Telegram, без публикаций:
 docker compose -f docker-compose.yml -f docker-compose.reddit.yml run --rm --no-deps reddit python -m boterator_app.reddit_feed check
-# Только чтение RSS и просмотр подготовленных сообщений, БД не меняется:
+# Только чтение выбранного источника и просмотр подготовленных сообщений:
 docker compose -f docker-compose.yml -f docker-compose.reddit.yml run --rm --no-deps reddit python -m boterator_app.reddit_feed preview
 # Включение только после согласованного переключения:
 REDDIT_PUBLISH_ENABLED=1 docker compose -f docker-compose.yml -f docker-compose.reddit.yml up -d --no-deps --no-build reddit

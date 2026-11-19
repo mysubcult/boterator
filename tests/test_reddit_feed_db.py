@@ -21,7 +21,7 @@ class DatabaseFlow(unittest.IsolatedAsyncioTestCase):
         self.feed = {'name':'test','style':'thought','channel':'@test','bot_id':1}
         self.old = Post('t3_old','Old','https://example.org','https://reddit.com')
         self.new = Post('t3_new','New','https://example.org','https://reddit.com')
-        self.reddit = SimpleNamespace(fetch=AsyncMock(return_value=[self.old]))
+        self.reddit = SimpleNamespace(source='rss', fetch=AsyncMock(return_value=[self.old]))
         self.bot = SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=99)),
                                    session=SimpleNamespace(close=AsyncMock()))
         self.bot_patch = patch('boterator_app.reddit_feed.bot_for', AsyncMock(return_value=self.bot))
@@ -103,6 +103,37 @@ class DatabaseFlow(unittest.IsolatedAsyncioTestCase):
         await cycle(self.conn,self.reddit,self.feed,'run')
         self.assertEqual(await self.conn.fetchval("SELECT COUNT(*) FROM reddit_feed_posts WHERE status='pending'"),2)
         self.assertEqual(await self.conn.fetchval("SELECT COUNT(*) FROM reddit_feed_posts WHERE status='sending'"),1)
+
+    async def test_switch_from_existing_rss_state_to_oauth_preserves_history(self):
+        await cycle(self.conn, self.reddit, self.feed, 'init')
+        self.assertEqual(await self.conn.fetchval("SELECT source_key FROM reddit_feed_state"), 'test:hot:')
+        self.reddit.fetch.return_value = [self.new]
+        await cycle(self.conn, self.reddit, self.feed, 'run')
+        self.reddit.source = 'oauth'
+        archive = Post('t3_archive', 'Older', 'https://example.org', 'https://reddit.com')
+        self.reddit.fetch.return_value = [self.new, archive]
+        await cycle(self.conn, self.reddit, self.feed, 'run')
+        await cycle(self.conn, self.reddit, self.feed, 'run')
+        self.assertEqual(self.bot.send_message.await_count, 1)
+        self.assertEqual(await self.conn.fetchval("SELECT source_key FROM reddit_feed_state"), 'oauth:test:hot:')
+        self.assertEqual(await self.conn.fetchval("SELECT message_ids FROM reddit_feed_posts WHERE post_id='t3_new'"), [99])
+        self.reddit.fetch.return_value = [Post('t3_fresh', 'Fresh', 'https://example.org', 'https://reddit.com')]
+        await cycle(self.conn, self.reddit, self.feed, 'run')
+        self.assertEqual(self.bot.send_message.await_count, 2)
+
+    async def test_switch_does_not_publish_previous_pending_queue_or_held_snapshot(self):
+        await cycle(self.conn, self.reddit, self.feed, 'init')
+        await self.conn.execute("UPDATE reddit_feed_posts SET status='pending'")
+        self.reddit.source = 'oauth'
+        from boterator_app.reddit_feed import SourceError
+        with self.assertRaisesRegex(SourceError, 'unfinished deliveries'):
+            await cycle(self.conn, self.reddit, self.feed, 'run')
+        self.assertEqual(await self.conn.fetchval("SELECT status FROM reddit_feed_posts"), 'pending')
+        await self.conn.execute("UPDATE reddit_feed_posts SET status='held'")
+        await cycle(self.conn, self.reddit, self.feed, 'run')
+        await cycle(self.conn, self.reddit, self.feed, 'run')
+        self.assertEqual(await self.conn.fetchval("SELECT status FROM reddit_feed_posts"), 'baseline')
+        self.bot.send_message.assert_not_called()
 
     async def test_second_worker_cannot_take_lock(self):
         await self.conn.fetchval('SELECT pg_try_advisory_lock(74236918024)')
