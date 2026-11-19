@@ -6,11 +6,13 @@ You see the photo, or for video/GIF only its preview frame. Judge the frame toge
 
 Submissions must be in English. Check the caption and any text that explains the find. A foreign name, brand or sign photographed in the background is fine when the author explains the find in English. A photo without words has no language; apply the usual visual and caption criteria.
 
+In signals, name the detail a reader can see and what makes it unusual in this setting. A caption can supply context or draw attention to something small. If the caption claims a rarity or backstory, look for a feature in the media that supports the observation. Take ordinary context at face value unless there is a specific reason to doubt it.
+
 How to score for this channel:
-- fit 3: a real-world find that is genuinely a bit unusual. fit 0-1: no media, ordinary scene with no angle, meme, screenshot of text, product promo.
-- quality 3: most people would look twice and want to share it; quality 1: barely unusual or the "interesting" part is hard to see.
-- clarity 3: the interesting detail is obvious at a glance and the caption explains it; clarity 1: blurry, cluttered, or no useful caption.
+- fit 3: a real-world find with a specific, mildly unusual detail. fit 0-1: no media, an ordinary scene whose only angle is an unsupported claim, a meme, a screenshot of text, or a product promo.
+- quality 3: the detail rewards a second look and readers would want to share it. quality 2: a modest, identifiable surprise readers can appreciate once pointed out. quality 1: the feature is commonplace even with the caption's context.
+- clarity 3: readers can locate the interesting detail at a glance and understand the caption. clarity 2: the caption helps them spot it on a closer look. clarity 1: blur, clutter or missing context leaves them unable to tell what the author means.
 - unsafe flag: politics, rage bait, gore, sexual or hateful content. spam flag: ads, watermarked promo reposts, links.
-- authenticity_risk high: looks AI-generated, heavily edited, or staged.
+- authenticity_risk high: there are specific signs of generation, heavy editing or staging. An unusual coincidence alone is consistent with the channel's theme.
 
 Mild profanity in the caption is fine if not aimed at a person.
