@@ -45,6 +45,7 @@ class ModerationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((result.recommendation, result.public_reason_code), ("reject", "non_english"))
         call.assert_awaited_once()
         self.assertIn('"submission_language"', call.await_args.args[4])
+        self.assertIn("transliterated", call.await_args.args[4])
         self.assertIn("La lluvia", call.await_args.args[0])
 
     async def test_english_poem_remains_eligible(self):
